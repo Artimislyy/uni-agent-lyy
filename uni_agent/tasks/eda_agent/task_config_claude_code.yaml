@@ -1,0 +1,45 @@
+# EDA 任务的运行时默认值。
+# preprocess.py 生成的每一行会补充 task_root、可见/隐藏路径和 metadata；
+# Gateway 会在运行时补充模型地址、密钥和模型名。
+- name: eda
+  sandbox:
+    # Docker 在 Ray task 所在节点创建一次性容器，并用 docker cp 传输二进制 checkpoint。
+    provider: docker
+    # 运行时由 EDA_SANDBOX_IMAGE 覆盖；该镜像必须已存在于所有候选 Ray 节点。
+    image: crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.1
+    # 保留通用生命周期语义；当前 Docker backend 由下方的 sleep 9000 实际兜底。
+    runtime_timeout: 9000 #容器最长存活 9000 秒（2.5 小时）
+    sandbox_kwargs:
+      # 不在 rollout 时临时拉取大镜像，缺失时直接给出明确错误。
+      pull_policy: never
+      run_args:
+        - --network
+        - host
+        - --init
+        - --cpus=8
+        - --memory=32g
+      # Docker backend 不使用 runtime_timeout；有限 sleep 为强制取消后的孤儿容器兜底。
+      entrypoint: sleep #容器启动后，让它执行 sleep 9000，保持存活最多 9000 秒
+      command: ["9000"]
+
+  agent:
+    name: claude_code
+    max_turns: 200
+    run_timeout: 7200 # 整个 Agent 运行最长 7200 秒（2 小时）
+    enable_web_tools: false # 禁用联网搜索/网页工具
+    enable_subagents: false # 禁止派生子 Agent
+    disable_slash_commands: true # 禁用斜杠命令（如 /init 之类），防止 Agent 触发不该触发的操作。
+    model: #模型采样参数
+      temperature: 1.0
+      top_p: 1.0
+
+  # 每个阶段各自拥有一个容器；Framework session_timeout 需要覆盖二者总时间。
+  remote_workspace: /workspace/uni-agent-eda #任务文件都放在容器的这个路径下
+  innovus_bin: innovus #镜像中Innovus 程序名称
+  eval_timeout: 7200 #评测（打分/验证结果）最长 2 小时
+  max_submission_bytes: 1048576 #repair.tcl最大 1MB（1048576 字节 = 1 MB）
+  policy_violation_reward: -1.0 #仅明确的 verifier 违规或符号链接提交使用此值；普通失败、超时和读取故障为 0。
+  max_partial_credit: 0.5 #正常验收失败最多得 0.5 分；设为 0 可关闭部分分。
+  sandbox_image_env: EDA_SANDBOX_IMAGE #镜像名从环境变量 EDA_SANDBOX_IMAGE 读取，而不是写死上面那个 image: 值。方便换镜像不用改配置文件。
+  submission_dir: /output/uni-agent-eda/submissions #未设置环境变量时，repair.tcl 保存到该宿主机目录。
+  submission_dir_env: EDA_SUBMISSION_DIR #如果设置了该环境变量，优先使用其指定的目录。

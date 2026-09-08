@@ -20,6 +20,7 @@ TASK_REGISTRY: dict[str, type[Task]] = {}
 
 #: name -> module that defines (and registers) the task, for lazy loading.
 TASK_MODULES: dict[str, str] = {
+    "eda": "uni_agent.tasks.eda_agent.task",
     "harbor": "uni_agent.tasks.harbor.task",
     "swe_bench": "uni_agent.tasks.swe_bench.task",
     "swe_bench_multilingual": "uni_agent.tasks.swe_bench_multilingual.task",

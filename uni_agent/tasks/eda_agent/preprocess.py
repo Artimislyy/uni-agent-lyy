@@ -7,14 +7,14 @@
 2. 用 ``task.json`` 和 ``metadata.json`` 校验任务信息。
 3. 按数据来源划分训练集和验证集，并检查同源数据泄漏。
 4. 将 system prompt、user prompt 和 task.md 组合成训练样本。
-5. 输出 JSONL/Parquet、划分清单和审计信息。
+5. 输出 JSON/Parquet、划分清单和审计信息。
 
 示例：
 
     python3 -m uni_agent.tasks.eda_agent.preprocess \
         --dataset-root DATASET \
         --output-dir OUTPUT \
-        --output-format jsonl
+        --output-format json
 
 使用 ``--check-only`` 可以只检查数据和划分，不生成文件。
 """
@@ -369,39 +369,39 @@ def make_row(
     """把 Sample 转换成 Uni-Agent 读取的一行数据。"""
 
     metadata = {
-        "task_id": sample.task_id,
-        "task_relpath": sample.relpath.removeprefix("tasks/"),
-        "design": sample.design,
-        "task_type": sample.task_type,
-        "difficulty": sample.difficulty,
-        "repair_family_id": sample.repair_family,
-        "source_dataset": sample.source_dataset,
-        "source_sample": sample.source_sample,
-        "validation_status": sample.validation_status,
-        "split": split,
-        "tool": sample.tool,
-        "tool_version": sample.tool_version,
-        "objective_json": json_text(sample.task_json.get("objective", {})),
-        "initial_metrics_json": json_text(sample.task_json.get("initial_metrics", {})),
-        "forbidden_commands_json": json_text(sample.task_json.get("forbidden_commands", [])),
+        "task_id": sample.task_id, #题目的编号，task_0001
+        "task_relpath": sample.relpath.removeprefix("tasks/"),#ibex_top/task_0001
+        "design": sample.design, #电路设计名称，ibex_top、jpeg_encoder
+        "task_type": sample.task_type, #需要修复的问题类型，setup_repair 表示修复 setup 时序问题
+        "difficulty": sample.difficulty, #题目难度，easy、medium、hard；缺少时可能为 unspecified
+        "repair_family_id": sample.repair_family, #修复类型或方法类别的标识；同类修复不一定来自同一道原题
+        "source_dataset": sample.source_dataset,#哪个来源数据集，jpeg_easy_medium_v3
+        "source_sample": sample.source_sample, # 来源数据集中的样本编号，jpeg_easy_medium_v3/0001
+        "validation_status": sample.validation_status, #PASS、PASS_FRESH_LOAD_GOLDEN 等，表示任务是否通过验证
+        "split": split,#train 或 validation，表示该任务属于训练集还是验证集
+        "tool": sample.tool,#EDA 工具名称，通常是 Innovus
+        "tool_version": sample.tool_version, #EDA 工具版本号，通常是 Innovus 的版本号
+        "objective_json": json_text(sample.task_json.get("objective", {})), #从 task.json 提取的修复目标，转换成 JSON 字符串保存,需要达到的时序、DRV 等要求
+        "initial_metrics_json": json_text(sample.task_json.get("initial_metrics", {})),#从 task.json 提取的初始设计指标,修复前的 WNS、TNS、违例数量
+        "forbidden_commands_json": json_text(sample.task_json.get("forbidden_commands", [])),#从 task.json 提取的禁用命令列表, '["optDesign"]'
     }
     return {
         "schema_version": 1,
-        "data_source": DATA_SOURCE,
-        "instance_id": sample.relpath.removeprefix("tasks/"),
+        "data_source": DATA_SOURCE, #dataset_innovus_19_10
+        "instance_id": sample.relpath.removeprefix("tasks/"), #ibex_top/task_0001
         "prompt": make_prompt(system_prompt, user_prompt, sample.task_md),
         "extra_info": {
             "tools_kwargs": {
                 "task": {
-                    "name": TASK_NAME,
-                    "task_root": sample.relpath,
-                    "dataset_root_env": dataset_root_env,
-                    "visible_paths": VISIBLE_PATHS,
+                    "name": TASK_NAME, #eda
+                    "task_root": sample.relpath, #ibex_top/task_0001
+                    "dataset_root_env": dataset_root_env, #EDA_DATASET_ROOT
+                    "visible_paths": VISIBLE_PATHS, #["task.md", "initial_state/design.enc", "initial_state/design.enc.dat"]
                     "hidden_paths": [path for path in HIDDEN_PATHS if (sample.root / path).exists()],
-                    "verifier_path": VERIFIER_PATH,
-                    "answer_path": ANSWER_PATH,
-                    "result_path": RESULT_PATH,
-                    "metadata": metadata,
+                    "verifier_path": VERIFIER_PATH,#"verifier/verify.tcl"
+                    "answer_path": ANSWER_PATH,#"repair.tcl"
+                    "result_path": RESULT_PATH,#"verifier_output/result.json"
+                    "metadata": metadata, #任务元数据
                 }
             }
         },
@@ -462,13 +462,13 @@ def print_summary(splits: dict[str, list[Sample]], lfs_count: int, preview: int)
 # ============================== 写入输出 ==============================
 
 
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    """写入易于人工查看的 JSONL，并核对行数。"""
+def write_json(path: Path, rows: list[dict[str, Any]]) -> None:
+    """写入带缩进的 JSON 数组，并核对任务数量。"""
 
-    content = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    content = json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     path.write_text(content, encoding="utf-8")
-    if sum(1 for line in content.splitlines() if line) != len(rows):
-        raise PreprocessError(f"JSONL row count mismatch: {path}")
+    if len(json.loads(content)) != len(rows):
+        raise PreprocessError(f"JSON row count mismatch: {path}")
 
 
 def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -503,7 +503,7 @@ def write_outputs(
 ) -> None:
     """生成数据文件、manifest 和 audit；默认不覆盖已有文件。"""
 
-    extensions = ("jsonl", "parquet") if args.output_format == "both" else (args.output_format,)
+    extensions = ("json", "parquet") if args.output_format == "both" else (args.output_format,)
     data_paths = {
         (split, extension): output_dir / f"{OUTPUT_PREFIX}_{split}.{extension}"
         for split in splits
@@ -524,7 +524,7 @@ def write_outputs(
     }
     write_manifest(manifest_path, make_manifest(splits))
     for (split, extension), path in data_paths.items():
-        writer = write_jsonl if extension == "jsonl" else write_parquet
+        writer = write_json if extension == "json" else write_parquet
         writer(path, rows_by_split[split])
 
     audit = {
@@ -581,10 +581,10 @@ def build_parser() -> argparse.ArgumentParser:
     )  # 运行任务时用于定位数据集根目录的环境变量名。
     parser.add_argument(
         "--output-format",
-        choices=("jsonl", "parquet", "both"),
+        choices=("json", "parquet", "both"),
         default="both",
         help="Output format; default: both.",
-    )  # 输出格式：JSONL、Parquet，或者同时生成两种格式；默认同时生成。
+    )  # 输出格式：JSON、Parquet，或者同时生成两种格式；默认同时生成。
     parser.add_argument(
         "--preview",
         type=int,
