@@ -127,6 +127,30 @@ class EDATask(Task):
                 messages=cfg.prompt,
                 workdir=agent_root,
             ) #启动 Agent（Claude Code），在容器里干活
+            infer_status = _infer_status(agent_result.finished, agent_result.info)
+            common_info = {
+                "task_root": str(task_root),
+                "task_id": cfg.metadata.get("task_id"),
+                "submission_path": None,
+                "submission_status": "NOT_ATTEMPTED",
+                "infer_completed": agent_result.finished is True,
+                "infer_status": infer_status,
+                "agent_info": agent_result.info,
+                "isolation": {
+                    "strategy": "fresh_sandbox",
+                    "submission_transfer": "memory_only",
+                    "reference_uploaded": False,
+                },
+            }
+            # 只有明确正常结束才读取、留档答案；提前返回也会退出上下文并清理 A。
+            if agent_result.finished is not True:
+                return TaskResult(
+                    reward=0.0,
+                    accuracy=0.0,
+                    finished=False,
+                    extra_info=failure_report(infer_status, **common_info),
+                )
+
             submission, submission_status, submission_path = await _read_submission(
                 agent_sandbox,
                 _remote_path(agent_root, cfg.answer_path),
@@ -137,21 +161,10 @@ class EDATask(Task):
             )#从容器里读出答案文件 repair.tcl，并检查大小不超过上限（1MB）。
         # 离开上下文后，Claude Code、Innovus 进程和脏工作区一起被销毁。
 
-        infer_status = _infer_status(agent_result.finished, agent_result.info)
-        common_info = {
-            "task_root": str(task_root),
-            "task_id": cfg.metadata.get("task_id"),
-            "submission_path": str(submission_path) if submission_path else None,
-            "submission_status": submission_status,
-            "infer_completed": agent_result.finished is not False,
-            "infer_status": infer_status,
-            "agent_info": agent_result.info,
-            "isolation": {
-                "strategy": "fresh_sandbox",
-                "submission_transfer": "memory_only",
-                "reference_uploaded": False,
-            },
-        }
+        common_info.update(
+            submission_path=str(submission_path) if submission_path else None,
+            submission_status=submission_status,
+        )
         if submission is None:
             # 只有符号链接等明确不安全提交才扣分；缺失、空文件、超大和读取故障均为 0。
             score = cfg.policy_violation_reward if submission_status == "UNSAFE_SUBMISSION" else 0.0
@@ -336,7 +349,8 @@ def _new_workspace(base: str, phase: str) -> str:
 def _infer_status(finished: bool | None, info: object) -> str:
     """区分 Agent 正常结束、超时和其他未完成情况。"""
 
-    if finished is not False:
+    # 只有 True 才确认正常结束；None 表示未确认完成。
+    if finished is True:
         return "FINISHED"
     if isinstance(info, dict) and (
         info.get("exit_code") == -1

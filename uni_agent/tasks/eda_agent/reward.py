@@ -14,7 +14,6 @@ from uni_agent.sandbox import SandboxBackend
 logger = logging.getLogger(__name__)
 
 _LOG_TAIL_CHARS = 4000
-_MAX_RESULT_BYTES = 2 * 1024 * 1024
 # result.json 的 failure_type 恰好等于以下值时，直接判定违规。
 _POLICY_FAILURE_TYPES = {"FORBIDDEN_COMMAND", "POLICY_VIOLATION"}
 _PARTIAL_CHECK_GROUPS = (
@@ -192,8 +191,6 @@ async def _read_result(
         raw = await sandbox.read_file(path)
     except Exception:
         return None, "MISSING_RESULT" #读取抛出异常
-    if len(raw) > _MAX_RESULT_BYTES: #检查读出内容是否超过 2 MiB
-        return None, "INVALID_RESULT"
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError): #编码错误或 JSON 语法错误返回

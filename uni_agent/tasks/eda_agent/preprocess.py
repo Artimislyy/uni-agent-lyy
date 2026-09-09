@@ -6,7 +6,7 @@
 1. 从 ``tasks/index.tsv`` 读取权威任务清单。
 2. 用 ``task.json`` 和 ``metadata.json`` 校验任务信息。
 3. 按数据来源划分训练集和验证集，并检查同源数据泄漏。
-4. 将 system prompt、user prompt 和 task.md 组合成训练样本。
+4. 将 system prompt、SKILL.md、user prompt 和 task.md 组合成训练样本。
 5. 输出 JSON/Parquet、划分清单和审计信息。
 
 示例：
@@ -345,13 +345,14 @@ def split_samples(samples: list[Sample]) -> dict[str, list[Sample]]:
 # ============================== 构造训练样本 ==============================
 
 
-def make_prompt(system_prompt: str, user_prompt: str, task_md: str) -> list[dict[str, str]]:
+def make_prompt(system_prompt: str, user_prompt: str, task_md: str, skill_prompt: str) -> list[dict[str, str]]:
     """构造 ClaudeCodeAgent 所需的单条 user 消息。"""
 
-    # ClaudeCodeAgent 只接收一条 user 消息，因此把三段提示词合并。
+    # 保留单条 user 消息，把操作规则、技能全文和题目要求合并。
     content = "\n\n".join(
         [
             f"## EDA agent operating instructions\n\n{system_prompt.strip()}",
+            f"## Innovus ECO closure skill (SKILL.md)\n\n{skill_prompt.strip()}",
             f"## Task request\n\n{user_prompt.strip()}",
             f"## Current task specification (task.md)\n\n{task_md.strip()}",
         ]
@@ -364,6 +365,7 @@ def make_row(
     split: str,
     system_prompt: str,
     user_prompt: str,
+    skill_prompt: str,
     dataset_root_env: str,
 ) -> dict[str, Any]:
     """把 Sample 转换成 Uni-Agent 读取的一行数据。"""
@@ -389,7 +391,7 @@ def make_row(
         "schema_version": 1,
         "data_source": DATA_SOURCE, #dataset_innovus_19_10
         "instance_id": sample.relpath.removeprefix("tasks/"), #ibex_top/task_0001
-        "prompt": make_prompt(system_prompt, user_prompt, sample.task_md),
+        "prompt": make_prompt(system_prompt, user_prompt, sample.task_md, skill_prompt),
         "extra_info": {
             "tools_kwargs": {
                 "task": {
@@ -496,6 +498,7 @@ def write_outputs(
     splits: dict[str, list[Sample]],
     system_prompt: str,
     user_prompt: str,
+    skill_prompt: str,
     args: argparse.Namespace,
     excluded: list[dict[str, str]],
     index_sha256: str,
@@ -519,7 +522,10 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows_by_split = {
-        split: [make_row(sample, split, system_prompt, user_prompt, args.dataset_root_env) for sample in samples]
+        split: [
+            make_row(sample, split, system_prompt, user_prompt, skill_prompt, args.dataset_root_env)
+            for sample in samples
+        ]
         for split, samples in splits.items()
     }
     write_manifest(manifest_path, make_manifest(splits))
@@ -564,16 +570,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Directory used to save generated dataset files.",
     )  # 生成文件的保存目录；使用 --check-only 时可以不填写。
-    parser.add_argument(
-        "--system-prompt-file",
-        type=Path,
-        help="Custom system prompt file; defaults to EDA/skills/system_prompt.txt.",
-    )  # 自定义 system prompt 文件；不填写时读取 EDA/skills/system_prompt.txt。
-    parser.add_argument(
-        "--user-prompt-file",
-        type=Path,
-        help="Custom user prompt file; defaults to EDA/skills/user_prompt.txt.",
-    )  # 自定义 user prompt 文件；不填写时读取 EDA/skills/user_prompt.txt。
     parser.add_argument(
         "--dataset-root-env",
         default=DATASET_ROOT_ENV,
@@ -626,12 +622,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_root = args.dataset_root.expanduser().resolve()
         args.dataset_root = dataset_root
 
-        system_path = (args.system_prompt_file or dataset_root.parent / "skills/system_prompt.txt").resolve()
-        user_path = (args.user_prompt_file or dataset_root.parent / "skills/user_prompt.txt").resolve()
+        # 固定读取数据集同级 prompts 下的三个文件，读一次后供 make_prompt 拼接。
+        prompt_root = dataset_root.parent / "prompts"
+        system_path = prompt_root / "system_prompt.txt"
+        user_path = prompt_root / "user_prompt.txt"
+        skill_path = prompt_root / "innovus-eco-closure-mcp/SKILL.md"
         system_prompt = system_path.read_text(encoding="utf-8-sig").strip()
         user_prompt = user_path.read_text(encoding="utf-8-sig").strip()
-        if not system_prompt or not user_prompt:
-            raise PreprocessError("system_prompt.txt and user_prompt.txt must not be empty")
+        skill_prompt = skill_path.read_text(encoding="utf-8-sig").strip()
+        if not system_prompt or not user_prompt or not skill_prompt:
+            raise PreprocessError("system_prompt.txt, user_prompt.txt and SKILL.md must not be empty")
 
         samples, excluded, index_sha256 = load_samples(dataset_root)
         splits = split_samples(samples)
@@ -652,6 +652,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             splits,
             system_prompt,
             user_prompt,
+            skill_prompt,
             args,
             excluded,
             index_sha256,

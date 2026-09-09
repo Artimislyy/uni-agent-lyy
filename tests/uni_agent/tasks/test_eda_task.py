@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
 from uni_agent.agents import AgentResult
 from uni_agent.sandbox import ExecResult
-from uni_agent.tasks.eda_agent.reward import compute_reward, score_verifier_result
+from uni_agent.tasks.eda_agent import task as eda_task_module
+from uni_agent.tasks.eda_agent.reward import _read_result, compute_reward, score_verifier_result
 from uni_agent.tasks.eda_agent.task import EDATask, EDATaskConfig, _infer_status
 
 
@@ -62,16 +64,17 @@ class _FakeSandbox:
 
 
 class _FakeAgent:
-    def __init__(self, finished: bool = True, submission: bytes | None = b"# model answer\n"):
+    def __init__(self, finished: bool | None = True, submission: bytes | None = b"# model answer\n", info=None):
         self.finished = finished
         self.submission = submission
+        self.info = info if info is not None else {"exit_code": 0 if finished else -1}
 
     async def run(self, *, sandbox, messages, workdir):
         assert messages == [{"role": "user", "content": "repair it"}]
         assert not any("/verifier" in path or "/reference" in path for path in sandbox.uploads)
         if self.submission is not None:
             await sandbox.write_file(f"{workdir}/repair.tcl", self.submission)
-        return AgentResult(finished=self.finished, info={"exit_code": 0 if self.finished else -1})
+        return AgentResult(finished=self.finished, info=self.info)
 
 
 def _make_task_tree(tmp_path):
@@ -110,8 +113,7 @@ def _config() -> EDATaskConfig:
 
 @pytest.mark.cpu
 @pytest.mark.level0
-@pytest.mark.parametrize("agent_finished", [True, False])
-def test_task_uses_two_sandboxes_and_only_transfers_submission(monkeypatch, tmp_path, agent_finished):
+def test_task_uses_two_sandboxes_and_only_transfers_submission(monkeypatch, tmp_path):
     dataset = _make_task_tree(tmp_path)
     monkeypatch.setenv("EDA_DATASET_ROOT", str(dataset))
     events: list[str] = []
@@ -120,20 +122,65 @@ def test_task_uses_two_sandboxes_and_only_transfers_submission(monkeypatch, tmp_
     sandboxes = iter([agent_sandbox, eval_sandbox])
     task = EDATask(_config())
     monkeypatch.setattr(task, "build_sandbox", lambda: next(sandboxes))
-    monkeypatch.setattr(task, "build_agent", lambda: _FakeAgent(agent_finished))
+    monkeypatch.setattr(task, "build_agent", lambda: _FakeAgent())
 
     result = asyncio.run(task.run())
 
     assert result.reward == 1.0
     assert result.accuracy == 1.0
-    assert result.finished is agent_finished
+    assert result.finished is True
     assert events == ["start:agent", "stop:agent", "start:eval", "stop:eval"]
     assert not any("/verifier" in path or "/reference" in path for path in agent_sandbox.uploads)
     assert any("/verifier" in path for path in eval_sandbox.uploads)
     assert not any("/reference" in path or "/initial_state/reports" in path for path in eval_sandbox.uploads)
     assert b"# model answer" in next(data for path, data in eval_sandbox.files.items() if path.endswith("repair.tcl"))
     assert result.extra_info["isolation"]["strategy"] == "fresh_sandbox"
-    assert result.extra_info["infer_status"] == ("FINISHED" if agent_finished else "INFER_TIMEOUT")
+    assert result.extra_info["infer_status"] == "FINISHED"
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize("submission", [None, b"# answer already written\n"])
+@pytest.mark.parametrize(
+    "finished, info, expected_status",
+    [
+        (False, {"exit_code": -1}, "INFER_TIMEOUT"),
+        (False, {"exit_code": 1}, "INFER_INCOMPLETE"),
+        (False, {"exit_code": 1, "stderr_tail": "request timeout"}, "INFER_TIMEOUT"),
+        (None, {}, "INFER_INCOMPLETE"),
+    ],
+)
+def test_unfinished_agent_skips_submission_and_eval(monkeypatch, tmp_path, submission, finished, info, expected_status):
+    """未正常结束时，即使已有 Tcl 也不读取、不留档、不验证，只清理 A。"""
+
+    monkeypatch.setenv("EDA_DATASET_ROOT", str(_make_task_tree(tmp_path)))
+    events: list[str] = []
+    sandboxes = iter([_FakeSandbox("agent", events)])
+    config = _config()
+    submission_root = tmp_path / "submissions"
+    config.submission_dir = str(submission_root)
+    task = EDATask(config)
+    monkeypatch.setattr(task, "build_sandbox", lambda: next(sandboxes))
+    monkeypatch.setattr(task, "build_agent", lambda: _FakeAgent(finished, submission, info))
+    read_submission = AsyncMock(side_effect=AssertionError("不应读取未正常结束的 Agent 的答案"))
+    monkeypatch.setattr(eda_task_module, "_read_submission", read_submission)
+
+    result = asyncio.run(task.run())
+
+    read_submission.assert_not_awaited()
+    assert not submission_root.exists()
+    assert events == ["start:agent", "stop:agent"]
+    assert result.reward == 0.0
+    assert result.accuracy == 0.0
+    assert result.finished is False
+    assert result.extra_info["score"] == 0.0
+    assert result.extra_info["status"] == expected_status
+    assert result.extra_info["infer_status"] == expected_status
+    assert result.extra_info["infer_completed"] is False
+    assert result.extra_info["agent_info"] == info
+    assert result.extra_info["submission_status"] == "NOT_ATTEMPTED"
+    assert result.extra_info["submission_path"] is None
+    assert result.extra_info["eval_completed"] is False
 
 
 @pytest.mark.cpu
@@ -142,7 +189,7 @@ def test_task_uses_two_sandboxes_and_only_transfers_submission(monkeypatch, tmp_
     "finished, info, expected",
     [
         (True, {"exit_code": 0}, "FINISHED"),
-        (None, {}, "FINISHED"),
+        (None, {}, "INFER_INCOMPLETE"),
         (False, {"exit_code": -1}, "INFER_TIMEOUT"),
         (False, {"termination_reason": "request timeout"}, "INFER_TIMEOUT"),
         (False, {"exit_code": 1}, "INFER_INCOMPLETE"),
@@ -315,7 +362,6 @@ def test_policy_violation_never_receives_partial_credit():
 
 @pytest.mark.cpu
 @pytest.mark.level0
-@pytest.mark.parametrize("agent_finished", [True, False])
 @pytest.mark.parametrize(
     "fault, submission, expected_status",
     [
@@ -332,10 +378,8 @@ def test_policy_violation_never_receives_partial_credit():
         ("file_check_timeout", b"# answer", "UNREADABLE_SUBMISSION"),
     ],
 )
-def test_submission_failure_rewards_and_lifecycle(
-    monkeypatch, tmp_path, agent_finished, fault, submission, expected_status
-):
-    """覆盖六种读取失败；超时不放大惩罚，失败后关闭容器并跳过验证。"""
+def test_submission_failure_rewards_and_lifecycle(monkeypatch, tmp_path, fault, submission, expected_status):
+    """Agent 正常结束后检查答案；读取失败关闭容器并跳过验证。"""
 
     monkeypatch.setenv("EDA_DATASET_ROOT", str(_make_task_tree(tmp_path)))
     events: list[str] = []
@@ -372,20 +416,37 @@ def test_submission_failure_rewards_and_lifecycle(
     task = EDATask(config)
     sandboxes = iter([sandbox])
     monkeypatch.setattr(task, "build_sandbox", lambda: next(sandboxes))
-    monkeypatch.setattr(task, "build_agent", lambda: _FakeAgent(agent_finished, submission))
+    monkeypatch.setattr(task, "build_agent", lambda: _FakeAgent(submission=submission))
 
     result = asyncio.run(task.run())
 
     assert result.reward == (-0.25 if expected_status == "UNSAFE_SUBMISSION" else 0.0)
     assert result.accuracy == 0.0
-    assert result.finished is agent_finished
+    assert result.finished is True
     assert result.extra_info["score"] == result.reward
     assert result.extra_info["status"] == expected_status
     assert result.extra_info["submission_status"] == expected_status
-    assert result.extra_info["infer_status"] == ("FINISHED" if agent_finished else "INFER_TIMEOUT")
-    assert result.extra_info["agent_info"]["exit_code"] == (0 if agent_finished else -1)
+    assert result.extra_info["infer_status"] == "FINISHED"
+    assert result.extra_info["agent_info"]["exit_code"] == 0
     assert result.extra_info["eval_completed"] is False
     assert events == ["start:agent", "stop:agent"]
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.parametrize("reason_length", [0, 3 * 1024 * 1024])
+def test_read_result_accepts_valid_json_regardless_of_size(reason_length):
+    """合法结果不因文件大小被拒绝，包括超过原来 2 MiB 上限的结果。"""
+
+    sandbox = _FakeSandbox("eval", [])
+    result = {"task_id": "task_0001", "status": "FAIL", "reason": "x" * reason_length}
+    path = "/work/verifier_output/result.json"
+    sandbox.files[path] = json.dumps(result).encode()
+
+    parsed, read_status = asyncio.run(_read_result(sandbox, path, "task_0001"))
+
+    assert parsed == result
+    assert read_status == "OK"
 
 
 @pytest.mark.cpu
