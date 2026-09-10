@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 从任意目录调用都切回仓库根目录，保证 Ray 能打包 verl/ 与 uni_agent/。
+# 单机 NCCL 初始化崩溃的排查配置：绕过外部网络插件和 IB，输出详细日志。
+export NCCL_NET_PLUGIN=none
+export NCCL_NET=Socket
+export NCCL_IB_DISABLE=1
+export NCCL_DEBUG=INFO
+
+# 从任意目录调用都切回仓库根目录，保证相对路径一致。
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 cd "${repo_root}"
 
 : "${DATA_DIR:?Set DATA_DIR to the root directory containing the model and Parquet files}"
-: "${RUNTIME_DIR:?Set RUNTIME_DIR to the root directory for checkpoints, logs, and runtime_env}"
+: "${RUNTIME_DIR:?Set RUNTIME_DIR to the root directory for checkpoints and logs}"
 : "${EDA_DATASET_ROOT:?Set EDA_DATASET_ROOT to the dataset_innovus_19_10 directory}"
 : "${EDA_SANDBOX_IMAGE:?Set EDA_SANDBOX_IMAGE to the Docker image preloaded on every candidate Ray node}"
 
@@ -17,7 +23,6 @@ exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
 MODEL_PATH=${MODEL_PATH:-"${DATA_DIR}/models/Qwen3.5-4B"}
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/data/uni_agent/eda_train.parquet"}
 TEST_FILE=${TEST_FILE:-"${DATA_DIR}/data/uni_agent/eda_validation.parquet"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${RUNTIME_DIR}/data/uni_agent/runtime_env.yaml"} #Ray 代码分发、Python 环境、worker 环境变量
 TASK_CONFIG=${TASK_CONFIG:-uni_agent/tasks/eda_agent/task_config_claude_code.yaml}
 CKPTS_DIR=${CKPTS_DIR:-"${RUNTIME_DIR}/ckpts/${project_name}/${exp_name}"}
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RUNTIME_DIR}/logs/${project_name}/${exp_name}"}
@@ -44,13 +49,13 @@ GATEWAY_COUNT=${GATEWAY_COUNT:-2} #启动XX个gateway actor
 SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-18000} #一个session最长运行 5 小时（18000 秒）
 SANDBOX_STARTUP_CONCURRENCY=${SANDBOX_STARTUP_CONCURRENCY:-16} #限制“同时启动多少个 sandbox”。
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((8 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((24 * 1024))}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((128 * 1024))}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-"$(basename "${MODEL_PATH}")"} # Agent 发请求时用的就是这个别名
 MASK_UNFINISHED_EPISODE=${MASK_UNFINISHED_EPISODE:-True} #没做完的轨迹要不要参与训练，True 会 mask 掉，False 会直接参与训练。True 更安全，False 更快。
 
-USE_MBRIDGE=${USE_MBRIDGE:-True} # Megatron（NVIDIA 的训练框架）内部为了并行训练，会把权重切分、重排成自己专属的排布方式，和 HF 格式完全不同，mBridge 负责转换
+USE_MBRIDGE=${USE_MBRIDGE:-False} # Megatron（NVIDIA 的训练框架）内部为了并行训练，会把权重切分、重排成自己专属的排布方式，和 HF 格式完全不同，mBridge 负责转换
 USE_DIST_CKPT=${USE_DIST_CKPT:-False}
 OFFLOAD=${OFFLOAD:-True}
 OFFLOAD_FRACTION=${OFFLOAD_FRACTION:-1.0} #优化器状态 offload 的比例
@@ -83,7 +88,7 @@ if (((NNODES_ROLLOUT * NGPUS_PER_NODE) % ROLLOUT_TP != 0)); then
     exit 2
 fi
 
-for required_path in "${MODEL_PATH}" "${TRAIN_FILE}" "${TEST_FILE}" "${RUNTIME_ENV}" "${TASK_CONFIG}"; do
+for required_path in "${MODEL_PATH}" "${TRAIN_FILE}" "${TEST_FILE}" "${TASK_CONFIG}"; do
     if [[ ! -e "${required_path}" ]]; then
         echo "Error: required path does not exist: ${required_path}" >&2
         exit 2
@@ -154,8 +159,8 @@ trainer_args=(
     +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
-    actor_rollout_ref.actor.megatron.use_mbridge=${USE_MBRIDGE}
-    actor_rollout_ref.actor.megatron.vanilla_mbridge=${USE_MBRIDGE}
+    actor_rollout_ref.actor.megatron.use_mbridge=True
+    actor_rollout_ref.actor.megatron.vanilla_mbridge=False
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=${USE_DIST_CKPT}
     actor_rollout_ref.actor.megatron.param_offload=${OFFLOAD}
     actor_rollout_ref.actor.megatron.grad_offload=${OFFLOAD}
@@ -244,20 +249,22 @@ trainer_args=(
     trainer.nnodes=${NNODES_TRAIN}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
 
-    # 这些值会进入所有 Ray worker；数据路径和 Docker 镜像都必须在任务节点可用。
-    ++ray_kwargs.ray_init.runtime_env.env_vars.EDA_DATASET_ROOT="${EDA_DATASET_ROOT}"
-    ++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SANDBOX_IMAGE="${EDA_SANDBOX_IMAGE}"
-    ++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SUBMISSION_DIR="${SUBMISSION_DIR}"
-    ++ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY="${SANDBOX_STARTUP_CONCURRENCY}"
+    # 直接启动 Python 后，verl 内部仍使用 Ray；显式传入 worker 环境变量。
+    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET_PLUGIN='${NCCL_NET_PLUGIN}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET='${NCCL_NET}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE='${NCCL_IB_DISABLE}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_DEBUG='${NCCL_DEBUG}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_DATASET_ROOT='${EDA_DATASET_ROOT}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SANDBOX_IMAGE='${EDA_SANDBOX_IMAGE}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SUBMISSION_DIR='${SUBMISSION_DIR}'"
+    "++ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY='${SANDBOX_STARTUP_CONCURRENCY}'"
 )
 
-echo "Submitting EDA separate_async: train=${NNODES_TRAIN}x${NGPUS_PER_NODE} GPUs, rollout=${NNODES_ROLLOUT}x${NGPUS_PER_NODE} GPUs"
+echo "Starting EDA separate_async: train=${NNODES_TRAIN}x${NGPUS_PER_NODE} GPUs, rollout=${NNODES_ROLLOUT}x${NGPUS_PER_NODE} GPUs"
 echo "Each step uses ${TRAIN_PROMPT_BSZ} prompts x ${N_RESP_PER_PROMPT} trajectories; sandbox concurrency limit: ${CONCURRENCY}"
 echo "Accepted repair.tcl files will be saved under ${SUBMISSION_DIR}"
 
 # Docker 由 ray_task 所在宿主机的 daemon 创建，各候选节点需要 Docker 权限和同名镜像。
-ray job submit --no-wait --runtime-env "${RUNTIME_ENV}" \
-    -- env RAY_OVERRIDE_JOB_RUNTIME_ENV=1 \
-    python3 -m verl.trainer.main_ppo \
+python3 -m verl.trainer.main_ppo \
     "${trainer_args[@]}" \
     "$@"
