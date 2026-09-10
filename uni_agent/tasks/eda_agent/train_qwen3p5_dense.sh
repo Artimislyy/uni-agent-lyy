@@ -12,10 +12,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 cd "${repo_root}"
 
-: "${DATA_DIR:?Set DATA_DIR to the root directory containing the model and Parquet files}"
-: "${RUNTIME_DIR:?Set RUNTIME_DIR to the root directory for checkpoints and logs}"
-: "${EDA_DATASET_ROOT:?Set EDA_DATASET_ROOT to the dataset_innovus_19_10 directory}"
-: "${EDA_SANDBOX_IMAGE:?Set EDA_SANDBOX_IMAGE to the Docker image preloaded on every candidate Ray node}"
+# 默认使用 A100 服务器的路径和镜像；环境变量非空时优先使用环境变量。
+DATA_DIR=${DATA_DIR:-/home/l00951262/input}
+RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
+EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/dataset_innovus_19_10}
+EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.2-patch.2}
 
 project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.5-4B-megatron}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
