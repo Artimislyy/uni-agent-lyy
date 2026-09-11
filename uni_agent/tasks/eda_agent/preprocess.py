@@ -6,7 +6,7 @@
 1. 从 ``tasks/index.tsv`` 读取权威任务清单。
 2. 用 ``task.json`` 和 ``metadata.json`` 校验任务信息。
 3. 按数据来源划分训练集和验证集，并检查同源数据泄漏。
-4. 将 system prompt、SKILL.md、user prompt 和 task.md 组合成训练样本。
+4. 将 system prompt、SKILL.md 和 user prompt 组合成提示词，task.md 随任务文件上传沙箱。
 5. 输出 JSON/Parquet、划分清单和审计信息。
 
 示例：
@@ -17,6 +17,7 @@
         --output-format json
 
 使用 ``--check-only`` 可以只检查数据和划分，不生成文件。
+使用 ``--smoke-test`` 按 task_id 顺序选取 4 条训练数据和 2 条验证数据，用于打通训练流程。
 """
 
 from __future__ import annotations
@@ -345,16 +346,15 @@ def split_samples(samples: list[Sample]) -> dict[str, list[Sample]]:
 # ============================== 构造训练样本 ==============================
 
 
-def make_prompt(system_prompt: str, user_prompt: str, task_md: str, skill_prompt: str) -> list[dict[str, str]]:
+def make_prompt(system_prompt: str, user_prompt: str, skill_prompt: str) -> list[dict[str, str]]:
     """构造 ClaudeCodeAgent 所需的单条 user 消息。"""
 
-    # 保留单条 user 消息，把操作规则、技能全文和题目要求合并。
+    # 保留单条 user 消息，把操作规则、技能全文和任务请求合并；task.md 由 Agent 在沙箱读取。
     content = "\n\n".join(
         [
             f"## EDA agent operating instructions\n\n{system_prompt.strip()}",
             f"## Innovus ECO closure skill (SKILL.md)\n\n{skill_prompt.strip()}",
             f"## Task request\n\n{user_prompt.strip()}",
-            f"## Current task specification (task.md)\n\n{task_md.strip()}",
         ]
     )
     return [{"role": "user", "content": content}]
@@ -391,7 +391,7 @@ def make_row(
         "schema_version": 1,
         "data_source": DATA_SOURCE, #dataset_innovus_19_10
         "instance_id": sample.relpath.removeprefix("tasks/"), #ibex_top/task_0001
-        "prompt": make_prompt(system_prompt, user_prompt, sample.task_md, skill_prompt),
+        "prompt": make_prompt(system_prompt, user_prompt, skill_prompt),
         "extra_info": {
             "tools_kwargs": {
                 "task": {
@@ -503,6 +503,7 @@ def write_outputs(
     excluded: list[dict[str, str]],
     index_sha256: str,
     lfs_count: int,
+    eligible_count: int,
 ) -> None:
     """生成数据文件、manifest 和 audit；默认不覆盖已有文件。"""
 
@@ -535,7 +536,12 @@ def write_outputs(
 
     audit = {
         "source": {"dataset_root": str(args.dataset_root.resolve()), "index_sha256": index_sha256},
-        "selection": {"eligible": sum(map(len, splits.values())), "excluded": excluded},
+        "selection": {
+            "eligible": eligible_count,
+            "selected": sum(map(len, splits.values())),
+            "smoke_test": args.smoke_test,
+            "excluded": excluded,
+        },
         "split": {
             "strategy": "family-holdout-v1",
             "counts": {name: len(samples) for name, samples in splits.items()},
@@ -581,6 +587,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help="Output format; default: both.",
     )  # 输出格式：JSON、Parquet，或者同时生成两种格式；默认同时生成。
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Select the first 4 training and 2 validation samples by task_id for a training smoke test.",
+    )  # 保持原有来源划分，只输出用于打通训练流程的小数据集。
     parser.add_argument(
         "--preview",
         type=int,
@@ -635,7 +646,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         samples, excluded, index_sha256 = load_samples(dataset_root)
         splits = split_samples(samples)
-        lfs_count = count_lfs_pointers(samples)
+        if args.smoke_test:
+            limits = {"train": 4, "validation": 2}
+            for split, limit in limits.items():
+                if len(splits[split]) < limit:
+                    raise PreprocessError(
+                        f"--smoke-test requires at least {limit} {split} samples; found {len(splits[split])}"
+                    )
+            # load_samples 已按 task_id 排序，固定取前几条使试跑数据可复现。
+            splits = {split: group[:limits[split]] for split, group in splits.items()}
+        selected_samples = [sample for group in splits.values() for sample in group]
+        lfs_count = count_lfs_pointers(selected_samples)
         print_summary(splits, lfs_count, args.preview)
 
         # 检查模式默认只报告 LFS 状态；正式生成时默认要求真实资源已经下载。
@@ -657,6 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             excluded,
             index_sha256,
             lfs_count,
+            len(samples),
         )
         return 0
     except (OSError, PreprocessError) as exc:

@@ -236,7 +236,7 @@ trainer_args=(
 
     reward.reward_manager.name=dapo
     +reward.reward_kwargs.max_resp_len=${MAX_RESPONSE_LENGTH}
-    "trainer.logger=['console','wandb']"
+    "trainer.logger=['console']"
     trainer.project_name="${project_name}"
     trainer.experiment_name="${exp_name}"
     trainer.val_before_train=False
