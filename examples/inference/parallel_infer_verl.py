@@ -153,7 +153,6 @@ def init_config(args: argparse.Namespace, *, task_configs: list[dict], served_mo
                     "task_config_path": args.task_config,
                     "model_name": served_model_name,
                     "report_reward": True,
-                    "log_result_details": args.log_task_results,
                 },
             }
         },
@@ -356,7 +355,9 @@ def main() -> None:
         "--tensor-parallel-size", "--tp", dest="tensor_parallel_size", type=int, default=4, help="Tensor parallel size."
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="Engine GPU memory fraction.")
-    parser.add_argument("--prompt-length", type=int, default=None, help="Prompt component of the trajectory token budget.")
+    parser.add_argument(
+        "--prompt-length", type=int, default=None, help="Prompt component of the trajectory token budget."
+    )
     parser.add_argument(
         "--response-length", type=int, default=None,
         help="Response component of the trajectory token budget; overrides the task-config fallback.",
@@ -365,14 +366,12 @@ def main() -> None:
         "--max-num-batched-tokens", type=int, default=None,
         help="vLLM prefill token budget; enables chunked prefill when set.",
     )
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable engine CUDA graphs for initial debugging.")
+    parser.add_argument(
+        "--enforce-eager", action="store_true", help="Disable engine CUDA graphs for initial debugging."
+    )
     parser.add_argument(
         "--session-timeout-seconds", type=float, default=None,
         help="Timeout for the entire task, including agent execution and reward verification.",
-    )
-    parser.add_argument(
-        "--log-task-results", action="store_true",
-        help="Record task result details, including submission paths and verifier errors, in task.log.",
     )
     parser.add_argument(
         "--gateway-count",

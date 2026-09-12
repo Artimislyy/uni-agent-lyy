@@ -18,10 +18,10 @@ RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
 EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/codataset_innovus_19_10}
 EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.2-patch.2}
 
-project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.5-4B-megatron}
+project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.8-27B-megatron}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
 
-MODEL_PATH=${MODEL_PATH:-"${DATA_DIR}/models/Qwen3.5-4B"}
+MODEL_PATH=${MODEL_PATH:-"${DATA_DIR}/models/Qwen3.8-27B"}
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/data/uni_agent/eda_train.parquet"}
 TEST_FILE=${TEST_FILE:-"${DATA_DIR}/data/uni_agent/eda_validation.parquet"}
 TASK_CONFIG=${TASK_CONFIG:-uni_agent/tasks/eda_agent/task_config_claude_code.yaml}
@@ -50,8 +50,8 @@ GATEWAY_COUNT=${GATEWAY_COUNT:-2} #启动XX个gateway actor
 SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-18000} #一个session最长运行 5 小时（18000 秒）
 SANDBOX_STARTUP_CONCURRENCY=${SANDBOX_STARTUP_CONCURRENCY:-16} #限制“同时启动多少个 sandbox”。
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((32 * 1024))}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((210 * 1024))}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((40 * 1024))}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-"$(basename "${MODEL_PATH}")"} # Agent 发请求时用的就是这个别名
 MASK_UNFINISHED_EPISODE=${MASK_UNFINISHED_EPISODE:-True} #没做完的轨迹要不要参与训练，True 会 mask 掉，False 会直接参与训练。True 更安全，False 更快。
