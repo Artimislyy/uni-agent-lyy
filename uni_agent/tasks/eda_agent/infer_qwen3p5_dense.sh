@@ -6,6 +6,10 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
 cd "${repo_root}"
 
+# Running a Python file puts examples/inference on sys.path, not the repo root.
+# Expose both source packages to the driver and newly started Ray workers.
+export PYTHONPATH="${repo_root}:${repo_root}/verl${PYTHONPATH:+:${PYTHONPATH}}"
+
 DATA_DIR=${DATA_DIR:-/home/l00951262/input}
 RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
 MODEL_PATH=${MODEL_PATH:-"${DATA_DIR}/models/Qwen3.5-27B"}
