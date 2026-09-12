@@ -98,7 +98,8 @@ def init_config(args: argparse.Namespace, *, task_configs: list[dict], served_mo
         (m.get("max_total_tokens", DEFAULT_RESPONSE_LENGTH) for m in model_cfgs),
         default=DEFAULT_RESPONSE_LENGTH,
     )
-    response_length = int(max_total_tokens)
+    response_length = int(args.response_length if args.response_length is not None else max_total_tokens)
+    prompt_length = args.prompt_length if args.prompt_length is not None else DEFAULT_PROMPT_LENGTH
 
     # Fan-out: the framework runs rollout.n gateway sessions per prompt.
     rollout.n = max(1, args.n)
@@ -116,8 +117,17 @@ def init_config(args: argparse.Namespace, *, task_configs: list[dict], served_mo
     rollout.mode = "async"
     # Standalone inference has no trainer to broadcast weights.
     rollout.load_format = "auto"
-    rollout.prompt_length = DEFAULT_PROMPT_LENGTH
+    rollout.prompt_length = prompt_length
     rollout.response_length = response_length
+    # Explicit episode budgets also bound vLLM's context allocation. Otherwise
+    # a long-context model may allocate for its much larger native window.
+    if args.prompt_length is not None or args.response_length is not None:
+        rollout.max_model_len = prompt_length + response_length
+    if args.max_num_batched_tokens is not None:
+        rollout.max_num_batched_tokens = args.max_num_batched_tokens
+        rollout.enable_chunked_prefill = True
+    if args.enforce_eager:
+        rollout.enforce_eager = True
     rollout.tensor_model_parallel_size = args.tensor_parallel_size
     rollout.gpu_memory_utilization = args.gpu_memory_utilization
     rollout.calculate_log_probs = True
@@ -138,10 +148,12 @@ def init_config(args: argparse.Namespace, *, task_configs: list[dict], served_mo
                 "runner_fqn": "uni_agent.framework.task_runner.run_task",
                 "dispatch_mode": "ray_task",
                 "max_concurrent_sessions": max(0, args.concurrency),
+                "session_timeout_seconds": args.session_timeout_seconds,
                 "runner_kwargs": {
                     "task_config_path": args.task_config,
                     "model_name": served_model_name,
                     "report_reward": True,
+                    "log_result_details": args.log_task_results,
                 },
             }
         },
@@ -154,7 +166,7 @@ def init_config(args: argparse.Namespace, *, task_configs: list[dict], served_mo
 
     # Data.
     config.data.return_raw_chat = True
-    config.data.max_prompt_length = DEFAULT_PROMPT_LENGTH
+    config.data.max_prompt_length = prompt_length
     config.data.max_response_length = response_length
 
     return config
@@ -344,6 +356,24 @@ def main() -> None:
         "--tensor-parallel-size", "--tp", dest="tensor_parallel_size", type=int, default=4, help="Tensor parallel size."
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="Engine GPU memory fraction.")
+    parser.add_argument("--prompt-length", type=int, default=None, help="Prompt component of the trajectory token budget.")
+    parser.add_argument(
+        "--response-length", type=int, default=None,
+        help="Response component of the trajectory token budget; overrides the task-config fallback.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens", type=int, default=None,
+        help="vLLM prefill token budget; enables chunked prefill when set.",
+    )
+    parser.add_argument("--enforce-eager", action="store_true", help="Disable engine CUDA graphs for initial debugging.")
+    parser.add_argument(
+        "--session-timeout-seconds", type=float, default=None,
+        help="Timeout for the entire task, including agent execution and reward verification.",
+    )
+    parser.add_argument(
+        "--log-task-results", action="store_true",
+        help="Record task result details, including submission paths and verifier errors, in task.log.",
+    )
     parser.add_argument(
         "--gateway-count",
         type=int,
@@ -368,6 +398,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    for name in ("prompt_length", "response_length", "max_num_batched_tokens", "session_timeout_seconds"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
 
     ray.init()
 

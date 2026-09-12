@@ -15,7 +15,7 @@ cd "${repo_root}"
 # 默认使用 A100 服务器的路径和镜像；环境变量非空时优先使用环境变量。
 DATA_DIR=${DATA_DIR:-/home/l00951262/input}
 RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
-EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/dataset_innovus_19_10}
+EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/codataset_innovus_19_10}
 EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.2-patch.2}
 
 project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.5-4B-megatron}
@@ -44,14 +44,14 @@ ROLLOUT_TP=${GEN_TP:-2}
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-4} # 每步训练 XX 个题目
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-2} #每次更新用 XX 个
 PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-2} #每 XX 次更新同步一次权重给推理引擎
-N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-4} #每道题做 XX 条轨迹
-CONCURRENCY=${CONCURRENCY:-2} #最多同时运行**个session
+N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-1} #每道题做 XX 条轨迹
+CONCURRENCY=${CONCURRENCY:-16} #最多同时运行**个session
 GATEWAY_COUNT=${GATEWAY_COUNT:-2} #启动XX个gateway actor
 SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-18000} #一个session最长运行 5 小时（18000 秒）
 SANDBOX_STARTUP_CONCURRENCY=${SANDBOX_STARTUP_CONCURRENCY:-16} #限制“同时启动多少个 sandbox”。
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((24 * 1024))}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((128 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((32 * 1024))}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((16 * 1024))}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-"$(basename "${MODEL_PATH}")"} # Agent 发请求时用的就是这个别名
 MASK_UNFINISHED_EPISODE=${MASK_UNFINISHED_EPISODE:-True} #没做完的轨迹要不要参与训练，True 会 mask 掉，False 会直接参与训练。True 更安全，False 更快。

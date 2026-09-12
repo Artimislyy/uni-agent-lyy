@@ -13,8 +13,7 @@
       # 不在 rollout 时临时拉取大镜像，缺失时直接给出明确错误。
       pull_policy: never
       run_args:
-        - --network
-        - host
+        - --network=host
         - --init
         - --cpus=8
         - --memory=32g

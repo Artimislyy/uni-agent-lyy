@@ -85,6 +85,7 @@ async def run_task(
     api_key: str = "EMPTY",
     model_name: str | None = None,
     report_reward: bool = False,
+    log_result_details: bool = False,
     **_: Any,
 ) -> TaskResult:
     """Resolve the sample's task, run it against ``session``, and return its result.
@@ -131,6 +132,12 @@ async def run_task(
     with task_span(tools_kwargs, task_name=task_name, prompt=prompt) as span:
         task_instance = get_task(task)
         result = await task_instance.run()
+        if log_result_details:
+            logger.info(
+                "run_task result details: sample_index=%s details=%s",
+                sample_index,
+                result.extra_info,
+            )
         reward_posted = False
         if report_reward and session.reward_info_url:
             reward_posted = await _post_reward_info(session.reward_info_url, result)

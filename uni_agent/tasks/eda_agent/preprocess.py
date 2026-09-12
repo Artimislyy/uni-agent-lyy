@@ -14,7 +14,7 @@
     python3 -m uni_agent.tasks.eda_agent.preprocess \
         --dataset-root DATASET \
         --output-dir OUTPUT \
-        --output-format json
+        --output-format both
 
 使用 ``--check-only`` 可以只检查数据和划分，不生成文件。
 使用 ``--smoke-test`` 按 task_id 顺序选取 4 条训练数据和 2 条验证数据，用于打通训练流程。
