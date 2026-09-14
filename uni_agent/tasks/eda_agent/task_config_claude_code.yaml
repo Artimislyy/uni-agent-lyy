@@ -6,7 +6,7 @@
     # Docker 在 Ray task 所在节点创建一次性容器，并用 docker cp 传输二进制 checkpoint。
     provider: docker
     # 运行时由 EDA_SANDBOX_IMAGE 覆盖；该镜像必须已存在于所有候选 Ray 节点。
-    image: crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.1
+    image: crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.3-patch.1
     # 保留通用生命周期语义；当前 Docker backend 由下方的 sleep 9000 实际兜底。
     runtime_timeout: 9000 #容器最长存活 9000 秒（2.5 小时）
     sandbox_kwargs:

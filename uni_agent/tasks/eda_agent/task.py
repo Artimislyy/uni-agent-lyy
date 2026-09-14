@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -35,6 +36,8 @@ class EDATaskConfig(TaskConfig):
     result_path: str = "verifier_output/result.json"
 
     remote_workspace: str = "/workspace/uni-agent-eda"
+    sandbox_init_command: list[str] = Field(default_factory=list)
+    sandbox_init_timeout: float = Field(default=120.0, gt=0)
     innovus_bin: str = "innovus"
     eval_timeout: float = Field(default=7200.0, gt=0)
     max_submission_bytes: int = Field(default=1024 * 1024, gt=0) #提交文件大小上限，默认 1 MiB
@@ -121,6 +124,7 @@ class EDATask(Task):
         # 第一段生命周期：模型只能看到 visible_paths。
         agent_root = _new_workspace(cfg.remote_workspace, "agent") #生成带 UUID 的路径字符串
         async with self.build_sandbox() as agent_sandbox: #创建一次性容器
+            await _initialize_sandbox(agent_sandbox, cfg.sandbox_init_command, cfg.sandbox_init_timeout)
             await _stage(agent_sandbox, task_root, cfg.visible_paths, agent_root) #创建目录，上传dat数据集
             agent_result = await self.build_agent().run(
                 sandbox=agent_sandbox,
@@ -187,6 +191,7 @@ class EDATask(Task):
         verifier_bundle = PurePosixPath(cfg.verifier_path).parent.as_posix()
         eval_paths = [*cfg.visible_paths, verifier_bundle if verifier_bundle != "." else cfg.verifier_path]
         async with self.build_sandbox() as eval_sandbox:
+            await _initialize_sandbox(eval_sandbox, cfg.sandbox_init_command, cfg.sandbox_init_timeout)
             await _stage(eval_sandbox, task_root, eval_paths, eval_root)
             await eval_sandbox.write_file(_remote_path(eval_root, cfg.answer_path), submission)
             report = await compute_reward(
@@ -209,6 +214,20 @@ class EDATask(Task):
             finished=agent_result.finished, #Agent 是否正常结束
             extra_info=report, #额外信息
         )
+
+
+async def _initialize_sandbox(sandbox: SandboxBackend, command: list[str], timeout: float) -> None:
+    """同步执行镜像初始化；失败日志在清理容器前写入任务日志。"""
+    if not command:
+        return
+    result = await sandbox.exec_shell(shlex.join(command) + " > /tmp/eda-init.log 2>&1", timeout=timeout)
+    log = await sandbox.exec(["tail", "-n", "200", "/tmp/eda-init.log"], timeout=10)
+    detail = log.stdout.strip() or log.stderr.strip() or "(initialization log is empty)"
+    if result.exit_code != 0:
+        message = f"EDA initialization failed (exit_code={result.exit_code}): {result.stderr}\n{detail}"
+        logger.error("%s", message)
+        raise RuntimeError(message)
+    logger.info("EDA initialization completed:\n%s", detail)
 
 
 async def _stage(sandbox: SandboxBackend, task_root: Path, paths: list[str], remote_root: str) -> None:

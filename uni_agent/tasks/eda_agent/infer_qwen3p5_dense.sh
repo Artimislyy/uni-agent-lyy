@@ -21,7 +21,7 @@ AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RUNTIME_DIR}/logs/EDA-rollout/${EXP_NAME}"}
 
 # Export these values: Docker sandboxes are created by Ray task workers.
 export EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/dataset_innovus_19_10}
-export EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.2-patch.2}
+export EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.3-patch.1}
 export EDA_SUBMISSION_DIR=${EDA_SUBMISSION_DIR:-"${AGENT_LOG_DIR}/submissions"}
 export SANDBOX_STARTUP_CONCURRENCY=${SANDBOX_STARTUP_CONCURRENCY:-2}
 export NCCL_NET_PLUGIN=${NCCL_NET_PLUGIN:-none}
@@ -36,8 +36,8 @@ CONCURRENCY=${CONCURRENCY:-1}
 GATEWAY_COUNT=${GATEWAY_COUNT:-2}
 LIMIT=${LIMIT:-1}
 N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-1}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((210 * 1024))}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((40 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((180 * 1024))}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((8 * 1024))}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-4096}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7}
 SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-18000}
@@ -88,7 +88,6 @@ python3 examples/inference/parallel_infer_verl.py \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --session-timeout-seconds "${SESSION_TIMEOUT_SECONDS}" \
     --enforce-eager \
-    --log-task-results \
     --log-dir "${AGENT_LOG_DIR}" \
     --result-path "${AGENT_LOG_DIR}/result.json" \
     "$@" 2>&1 | tee "${AGENT_LOG_DIR}/driver.log"
