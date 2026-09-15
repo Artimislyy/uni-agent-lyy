@@ -13,13 +13,19 @@
       # 不在 rollout 时临时拉取大镜像，缺失时直接给出明确错误。
       pull_policy: never
       run_args:
-        - --network=host
+        - --hostname=qingteng
+        - --mac-address=00:0c:29:95:37:37
         - --init
         - --cpus=8
         - --memory=32g
       # Docker backend 不使用 runtime_timeout；有限 sleep 为强制取消后的孤儿容器兜底。
-      entrypoint: sleep #容器启动后，让它执行 sleep 9000，保持存活最多 9000 秒
+      # 容器只负责保活；下方 sandbox_init_command 由 EDA 任务同步执行。
+      entrypoint: sleep
       command: ["9000"]
+
+  # 原入口先完成初始化，再 exec /bin/true 返回；成功后才启动 Claude/评测。
+  sandbox_init_command: ["/usr/local/bin/eda-container-entrypoint", "/bin/true"]
+  sandbox_init_timeout: 120
 
   agent:
     name: claude_code
@@ -31,6 +37,8 @@
     model: #模型采样参数
       temperature: 1.0
       top_p: 1.0
+    extra_env:
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS: "1800000"
 
   # 每个阶段各自拥有一个容器；Framework session_timeout 需要覆盖二者总时间。
   remote_workspace: /workspace/uni-agent-eda #任务文件都放在容器的这个路径下
