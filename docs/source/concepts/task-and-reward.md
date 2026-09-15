@@ -74,7 +74,7 @@ Without `prompt_template`, the dataset/source messages pass through unchanged. T
 
 After Task rendering, `TaskConfig.prompt` is the message list passed to `Agent.run()`. `prompt_template` is an input-only rendering directive and is omitted when Task configs are serialized. In Framework-managed execution, verl uses the source prompt for loader-time token-length checks when overlong-prompt filtering is enabled, makes it available as `raw_prompt` when a configured RewardLoop or judge scoring path is used, and preserves it as metadata in records written to TransferQueue. Task-rendered messages do not replace that source value. The trajectory token tensors are instead built from the Agent's actual model requests captured by the Gateway. Built-in SWE Tasks evaluate from `TaskConfig.metadata`, independently of `raw_prompt`.
 
-Task-rendered messages are not guaranteed to equal a self-rendering Agent's final internal prompt. Such an Agent may apply its own Sandbox-side template, and the current Task Runner cannot observe its final internal messages. `TaskResult` consequently reports episode results only and does not attempt to carry prompt provenance.
+Task-rendered messages are not guaranteed to equal a self-rendering Agent's final internal prompt. Such an Agent may apply its own Sandbox-side template, and the current Agent Runner cannot observe its final internal messages. `TaskResult` consequently reports episode results only and does not attempt to carry prompt provenance.
 
 ## Episode Implementation
 
@@ -149,8 +149,21 @@ TaskResult(
 )
 ```
 
-Custom Tasks may return scalar, dense, rubric-based, or multi-component rewards. The framework consumes
-`TaskResult.reward`; additional metrics belong in `accuracy` and `extra_info`.
+Custom Tasks may use any evaluation method, but the built-in Agent Runner currently
+expects `TaskResult.reward` to be a scalar outcome reward. `TaskResult.accuracy`
+becomes the validation metric `acc`; `extra_info` becomes the structured
+`runner_reward_info.reward_context` payload and is not aggregated as a metric.
+A trajectory postprocessor receives a deep copy of `TaskResult` as the
+`task_result` keyword argument. It can inspect or modify this copy without
+affecting subsequent scoring. Returned trajectories must preserve their
+`finished`, `reward_score`, and `reward_metrics` fields.
+When streaming Reward Loop Worker handles are available, the Framework passes
+the complete Runner result under `extra_info["runner_reward_info"]` to a
+configured custom scorer. Without such a scorer, a non-`None` Runner reward is
+used directly and the Worker is consulted only when the Runner did not return
+a reward. Custom Agent Runners return `TaskResult` when they provide episode
+annotations. A trajectory-only Runner may return `None`, which the Framework
+normalizes to an empty `TaskResult()` before trajectory scoring.
 
 `TaskResult.finished` is factual episode metadata copied from
 `AgentResult.finished`; it does not decide whether the trajectory contributes to
@@ -221,6 +234,8 @@ TASK_MODULES["my_task"] = "my_package.task"
 - Put sample-specific evaluation data in `metadata`.
 - Emit normal log records and let the invoking runtime bind their `LogContext`.
 - Return a `TaskResult` for every successful episode.
+- Use `finished=False` only when the Agent is known not to have completed
+  normally; leave it as `None` when the Agent does not report completion.
 - Let infrastructure failures propagate instead of silently converting them to zero reward.
 - Keep reward implementation close to the Task; do not force unrelated tasks into one reward schema.
 - Add preprocessing, a runnable Task Config, and tests for both successful and failed evaluations.

@@ -142,6 +142,7 @@ class ClaudeCodeAgent(Agent):
     # ----- helpers -----
     async def _ensure_claude(self, sandbox: Sandbox) -> None:
         if (await sandbox.exec_shell("command -v claude >/dev/null 2>&1")).exit_code == 0:
+            logger.info("claude_code: found existing claude on PATH; skipping installation")
             return
 
         has_npm = (await sandbox.exec_shell("command -v npm >/dev/null 2>&1")).exit_code == 0

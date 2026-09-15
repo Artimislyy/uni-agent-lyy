@@ -148,8 +148,6 @@ ray job submit --no-wait --runtime-env "$RUNTIME_ENV" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.max_concurrent_sessions=${CONCURRENCY} \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path=${TASK_CONFIG} \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name=${SERVED_MODEL_NAME} \
-    ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
-    ++actor_rollout_ref.rollout.custom.agent_framework.use_reward_loop_worker=False \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.data_parallel_size=${infer_dp} \
@@ -177,6 +175,8 @@ ray job submit --no-wait --runtime-env "$RUNTIME_ENV" \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     reward.reward_manager.name=dapo \
+    reward.custom_reward_function.path=pkg://uni_agent.framework.task_runner \
+    reward.custom_reward_function.name=score_from_runner_result \
     +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \

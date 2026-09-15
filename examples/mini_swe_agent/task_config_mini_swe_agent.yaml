@@ -30,7 +30,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/mini-swe-agent
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:20260910
   agent:
     name: mini_swe_agent
     step_limit: 100
@@ -50,7 +50,7 @@
       proxy_port: 38197
       mounts:
         - target: /opt/mini-swe-agent
-          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest
+          image_url: swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:20260910
   agent:
     name: mini_swe_agent
     step_limit: 100

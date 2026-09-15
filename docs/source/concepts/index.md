@@ -15,7 +15,7 @@ A normal episode runs from the top down:
 2. The `Task` starts its `Sandbox` and builds the configured `Agent`.
 3. The `Agent` interacts with the sandbox directly (black-box agent) or through a `Toolbox` (white-box agent).
 4. The `Task` evaluates the resulting sandbox state via `reward` module.
-5. The task returns a `TaskResult` containing the reward, metrics, and evaluation details.
+5. The task returns a `TaskResult` containing reward, accuracy, completion state, and evaluation details.
 
 ```text
 Task

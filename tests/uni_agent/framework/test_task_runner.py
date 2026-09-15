@@ -1,11 +1,13 @@
 import pytest
 
-from uni_agent.framework import task_runner
+from uni_agent.framework import task_runner as task_runner_module
 from uni_agent.framework.task_runner import (
     _extract_upstream,
     _inject_gateway_tunnel,
-    _reward_info_from_result,
     _rewrite_gateway_url,
+    compute_score,
+    run_task,
+    score_from_runner_result,
 )
 from uni_agent.gateway.session import SessionHandle
 from uni_agent.tasks import TaskConfig, TaskResult
@@ -71,49 +73,6 @@ def test_inject_gateway_tunnel_rejects_non_yuanrong_sandbox():
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_task_result_positional_field_order():
-    result = TaskResult(0.5, 1.0, False, {"reason": "limit"})
-
-    assert result.reward == 0.5
-    assert result.accuracy == 1.0
-    assert result.finished is False
-    assert result.extra_info == {"reason": "limit"}
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
-def test_reward_info_omits_unknown_agent_completion():
-    result = TaskResult(reward=0.5, accuracy=1.0)
-
-    assert _reward_info_from_result(result) == {
-        "reward": 0.5,
-        "acc": 1.0,
-    }
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
-@pytest.mark.parametrize("finished", [True, False])
-def test_reward_info_forwards_agent_completion(finished):
-    result = TaskResult(reward=0.0, finished=finished)
-
-    assert _reward_info_from_result(result) == {
-        "reward": 0.0,
-        "finished": finished,
-    }
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
-def test_reward_info_rejects_non_boolean_agent_completion():
-    result = TaskResult(reward=0.0, finished=0)  # type: ignore[arg-type]
-
-    with pytest.raises(ValueError, match="finished must be a bool or None"):
-        _reward_info_from_result(result)
-
-
-@pytest.mark.cpu
-@pytest.mark.level0
 @pytest.mark.asyncio
 async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_path):
     config_path = tmp_path / "tasks.yaml"
@@ -137,14 +96,13 @@ async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_
             captured["config"] = self.config
             return TaskResult(reward=1.0, accuracy=1.0, finished=True)
 
-    monkeypatch.setattr(task_runner, "get_task", _FakeTask)
+    monkeypatch.setattr(task_runner_module, "get_task", _FakeTask)
     source_prompt = [{"role": "user", "content": "Canonical source problem"}]
 
-    await task_runner.run_task(
+    await task_runner_module.run_task(
         session=SessionHandle(
             session_id="test-session",
             base_url="http://gateway/sessions/test/v1",
-            reward_info_url=None,
         ),
         raw_prompt=source_prompt,
         tools_kwargs={
@@ -157,3 +115,56 @@ async def test_run_task_binds_raw_prompt_to_sample_task_config(monkeypatch, tmp_
     )
 
     assert captured["config"].prompt == source_prompt
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+@pytest.mark.asyncio
+async def test_run_task_returns_task_result_while_ignoring_framework_tool_config(monkeypatch):
+    task_result = TaskResult(
+        reward=0.5,
+        accuracy=1.0,
+        finished=False,
+        extra_info={"report": {"resolved": 1}},
+    )
+
+    class _Resolver:
+        def resolve(self, sample_config, runtime_model):
+            assert sample_config["name"] == "stub"
+            assert runtime_model["base_url"] == "http://gateway/session/v1"
+            return {"name": "stub"}
+
+    class _Task:
+        async def run(self):
+            return task_result
+
+    monkeypatch.setattr(task_runner_module, "TaskConfigResolver", _Resolver)
+    monkeypatch.setattr(task_runner_module, "get_task", lambda task: _Task())
+
+    result = await run_task(
+        session=SessionHandle(session_id="session", base_url="http://gateway/session/v1"),
+        tools_kwargs={"task": {"name": "stub"}},
+        tool_config=[object()],
+    )
+
+    assert result is task_result
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_score_from_runner_result_passes_through_runner_reward_info():
+    assert compute_score is score_from_runner_result
+    assert score_from_runner_result(
+        data_source="stub",
+        solution_str="unused",
+        ground_truth="unused",
+        extra_info={
+            "runner_reward_info": {
+                "reward": "0.5",
+                "metrics": {"acc": True, "format": 0.8, "score": 0.75},
+                "reward_context": {"trace": "unused by pass-through"},
+            }
+        },
+        reward_router_address="http://reward-router",
+        reward_model_tokenizer=object(),
+    ) == {"score": 0.5, "acc": True, "format": 0.8}

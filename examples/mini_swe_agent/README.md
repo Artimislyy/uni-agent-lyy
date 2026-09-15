@@ -19,7 +19,8 @@ flowchart TB
     H --> J["MiniSweAgentAgent.run()<br/>base64 task config -> stdin of run_agent.py"]
     J --> K["in-sandbox mini-swe-agent<br/>executes in /testbed, LLM calls via gateway"]
     K --> L["result JSON on stdout<br/>finished = exit_status == Submitted"]
-    L --> M["compute_reward in the same sandbox<br/>POST reward_info to the session"]
+    L --> M["compute_reward in the same sandbox<br/>return typed TaskResult"]
+    M --> N["Framework / RewardLoopWorker<br/>attach reward and metrics"]
 ```
 
 Per sample, `uni_agent.framework.task_runner.run_task`:
@@ -30,9 +31,11 @@ Per sample, `uni_agent.framework.task_runner.run_task`:
    through the tunnel without needing to reach the training cluster directly.
 3. **Run** mini-swe-agent inside the sandbox: the task config is piped (base64) into the
    tool-image python, which runs the real mini-swe-agent against `/testbed` and the policy.
-4. **Score** in the same sandbox and POST the reward back (`report_reward=True`); an
-   episode counts as finished only when the agent actually submits a patch
-   (`exit_status == "Submitted"`), so unfinished ones are masked from the loss.
+4. **Score** in the same sandbox and return the reward in `TaskResult`; the
+   Framework passes it through the configured RewardLoop scorer and attaches the
+   resulting reward and metrics to the finalized trajectory. An episode counts as
+   finished only when the agent actually submits a patch (`exit_status ==
+   "Submitted"`), so unfinished ones are masked from the loss.
 
 ### Sandbox provider
 
@@ -174,7 +177,7 @@ rewritten through the reverse tunnel when `proxy_port` is set).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENYUANRONG_TUNNEL_SSL_VERIFY` | `0` | TLS verification for the sandbox reverse tunnel |
+| `OPENYUANRONG_TLS` | `1` | TLS for the frontend control plane (`0` for plain HTTP) |
 | `SANDBOX_NAME_PREFIX` | `mini-swe-` | Prefix for created sandbox names |
 
 **Rollout / framework runner**

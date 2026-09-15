@@ -12,6 +12,7 @@ A *task* is the top-level unit a trainer / evaluator instantiates. The base
 from __future__ import annotations
 
 import dataclasses
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -91,10 +92,27 @@ class TaskConfig(BaseModel):
 class TaskResult:
     """Outcome of one task episode."""
 
-    reward: Any
+    reward: float | None = None
     accuracy: float | None = None
     finished: bool | None = None
-    extra_info: dict[str, Any] | None = None
+    extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for field_name in ("reward", "accuracy"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"TaskResult.{field_name} must be a finite number or numeric string") from exc
+            if not math.isfinite(normalized):
+                raise ValueError(f"TaskResult.{field_name} must be a finite number or numeric string")
+            setattr(self, field_name, normalized)
+        if self.finished is not None and type(self.finished) is not bool:
+            raise ValueError("TaskResult.finished must be a bool or None")
+        if not isinstance(self.extra_info, dict):
+            raise ValueError("TaskResult.extra_info must be a dict")
 
 
 class Task(ABC):

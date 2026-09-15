@@ -14,7 +14,7 @@ from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
-from uni_agent.rlinsight_adapter import start_generation_span
+from uni_agent.rl_insight.adapter import start_generation_span
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
 
@@ -23,7 +23,7 @@ class SessionPhase(str, Enum):
     """Lifecycle state for a gateway session.
 
     Attributes:
-        ACTIVE: The session can accept generation and reward-info requests.
+        ACTIVE: The session can accept generation requests.
         FINALIZED: Final trajectories were returned and the session is closed.
         ABORTED: The session was cancelled and should not produce trajectories.
     """
@@ -114,6 +114,8 @@ class EncodedData:
             materialization.
         video_data: Video inputs carried into backend generation and trajectory
             materialization.
+        mm_processor_kwargs: Processor kwargs shared by prompt encoding and
+            backend multimodal preprocessing.
         capacity_exhausted: Whether preparation determined that no generation
             can fit within the total trajectory capacity.
         chain_id: Selected active chain id, or ``None`` when commit should append
@@ -135,6 +137,7 @@ class EncodedData:
     tools: list[dict[str, Any]] | None
     image_data: list[Any] | None
     video_data: list[Any] | None
+    mm_processor_kwargs: dict[str, Any]
     capacity_exhausted: bool
     chain_id: int | None
     incoming_message_prefix_hashes: list[str] = field(default_factory=list)
@@ -208,7 +211,6 @@ class GatewaySession:
         self._order_seq = 0
         self._rollback_count = 0
         self._rollback_dropped_trainable_tokens_total = 0
-        self.reward_info: dict[str, Any] = {}
         self.phase = SessionPhase.ACTIVE
         self.created_at = time.time()
         self.updated_at = self.created_at
@@ -230,8 +232,8 @@ class GatewaySession:
         here.
         """
         # Same-session requests overlap backend generation and commit in backend
-        # completion order. The framework currently scores session_trajectories[-1]
-        # and broadcasts that reward, so concurrent siblings share one reward target.
+        # completion order. That order also determines which trajectory an optional
+        # RewardLoopWorker treats as the session's final scoring input.
         reserved_chain_id: int | None = None
         generation_span = start_generation_span(self._trace_identity)
         try:
@@ -270,6 +272,7 @@ class GatewaySession:
                     sampling_params=encoded.sampling_params,
                     image_data=encoded.image_data,
                     video_data=encoded.video_data,
+                    mm_processor_kwargs=encoded.mm_processor_kwargs,
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
@@ -277,24 +280,37 @@ class GatewaySession:
                 raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}") from e
 
             response_ids = list(output.token_ids)
+            assistant_logprobs = None
+            if encoded.sampling_params.get("logprobs", False):
+                if output.log_probs is None:
+                    raise RuntimeError("backend omitted logprobs when requested")
+                assistant_logprobs = list(output.log_probs)
+                if len(assistant_logprobs) != len(response_ids):
+                    raise RuntimeError(
+                        "backend logprobs must align with token_ids: "
+                        f"got {len(assistant_logprobs)} logprobs for {len(response_ids)} tokens"
+                    )
+
+            runtime_token_ids = encoded.buffer.prompt_ids + encoded.buffer.response_ids
+            merged_token_ids, response_mask, response_logprobs = self._codec.merge_assistant_tokens(
+                runtime_token_ids,
+                response_ids,
+                encoded.buffer.response_mask,
+                encoded.buffer.response_logprobs if encoded.sampling_params.get("logprobs", False) else None,
+                assistant_logprobs=assistant_logprobs,
+            )
+            prompt_length = len(encoded.buffer.prompt_ids)
+            if merged_token_ids[:prompt_length] != encoded.buffer.prompt_ids:
+                raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
+            encoded.buffer.response_ids = list(merged_token_ids[prompt_length:])
+            encoded.buffer.response_mask = list(response_mask)
+            encoded.buffer.response_logprobs = list(response_logprobs or [])
             encoded.buffer.generation_versions.append(
                 (
                     output.extra_fields.get("min_global_steps"),
                     output.extra_fields.get("max_global_steps"),
                 )
             )
-            encoded.buffer.response_ids.extend(response_ids)
-            encoded.buffer.response_mask.extend([1] * len(response_ids))
-            if encoded.sampling_params.get("logprobs", False):
-                if output.log_probs is None:
-                    raise RuntimeError("backend omitted logprobs when requested")
-                log_probs = list(output.log_probs)
-                if len(log_probs) != len(response_ids):
-                    raise RuntimeError(
-                        "backend logprobs must align with token_ids: "
-                        f"got {len(log_probs)} logprobs for {len(response_ids)} tokens"
-                    )
-                encoded.buffer.response_logprobs.extend(log_probs)
             self._assert_response_logprob_alignment(encoded.buffer)
 
             # R3 router replay: the backend returns routing for the full context
@@ -346,17 +362,8 @@ class GatewaySession:
             if reserved_chain_id is not None:
                 await asyncio.shield(self._release_chain_reservation(reserved_chain_id))
 
-    async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
-        """Store session-level reward metadata without closing the session."""
-        async with self.request_lock:
-            if self.phase != SessionPhase.ACTIVE:
-                raise RuntimeError(f"Session {self.handle.session_id} is {self.phase.value.lower()}")
-            if reward_info is not None:
-                self.reward_info = dict(reward_info)
-            self._touch()
-
     async def finalize(self) -> list[Trajectory]:
-        """Close the session and return its materialized trajectories with rewards."""
+        """Close the session and return its materialized token trajectories."""
         async with self.request_lock:
             if self.phase == SessionPhase.ABORTED:
                 raise RuntimeError(f"Session {self.handle.session_id} is aborted")
@@ -371,7 +378,7 @@ class GatewaySession:
                 materialized.trajectory
                 for materialized in sorted(self.materialized_chains, key=lambda chain: chain.order_seq)
             ]
-            return [replace(trajectory, reward_info=dict(self.reward_info)) for trajectory in ordered_trajectories]
+            return ordered_trajectories
 
     async def abort(self) -> None:
         """Abort the session and prevent further generation."""
@@ -409,6 +416,7 @@ class GatewaySession:
         messages = request["messages"]
         tools = request["tools"]
         sampling_params = dict(request["sampling_params"])
+        mm_processor_kwargs = self._codec.mm_processor_kwargs or {}
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selection = self._select_chain(
             tools=tools,
@@ -419,7 +427,7 @@ class GatewaySession:
 
         if selection is None:
             image_data, video_data = await self._codec.extract_multi_modal_data(messages)
-            prompt_ids = self._codec.encode_full(
+            prompt_ids = self._codec.build_initial_tokens(
                 messages,
                 tools=tools,
                 image_data=image_data,
@@ -465,33 +473,46 @@ class GatewaySession:
                     del buffer.response_logprobs[assistant_prefix_start:]
                 self._assert_response_logprob_alignment(buffer)
                 incremental_messages = messages[last_assistant_start.message_history_len :]
+                previous_messages = messages[: last_assistant_start.message_history_len]
                 rollback_applied = True
             else:
                 incremental_messages = messages[len(selected_chain.message_history) :]
+                previous_messages = selected_chain.message_history
 
             new_image_data = None
             new_video_data = None
-            incremental_ids = []
+            updated_messages = previous_messages + incremental_messages
+            merged_token_ids = None
+            merged_response_mask = None
+            merged_response_logprobs = None
             current_trajectory_length = len(buffer.prompt_ids) + len(buffer.response_ids)
             capacity_exhausted = (
                 self._trajectory_capacity is not None and current_trajectory_length >= self._trajectory_capacity
             )
             if incremental_messages and not capacity_exhausted:
                 new_image_data, new_video_data = await self._codec.extract_multi_modal_data(incremental_messages)
-                incremental_ids = self._codec.encode_incremental(
-                    incremental_messages,
+                runtime_token_ids = buffer.prompt_ids + buffer.response_ids
+                merged_token_ids, merged_response_mask, merged_response_logprobs = self._codec.merge_context_tokens(
+                    previous_messages,
+                    updated_messages,
+                    runtime_token_ids,
+                    buffer.response_mask,
+                    buffer.response_logprobs if sampling_params.get("logprobs", False) else None,
+                    tools=tools,
                     image_data=new_image_data,
                     video_data=new_video_data,
                 )
                 capacity_exhausted = (
-                    self._trajectory_capacity is not None
-                    and current_trajectory_length + len(incremental_ids) >= self._trajectory_capacity
+                    self._trajectory_capacity is not None and len(merged_token_ids) >= self._trajectory_capacity
                 )
-            if not capacity_exhausted:
-                buffer.response_ids.extend(incremental_ids)
-                buffer.response_mask.extend([0] * len(incremental_ids))
-                if sampling_params.get("logprobs", False):
-                    buffer.response_logprobs.extend([0.0] * len(incremental_ids))
+            if not capacity_exhausted and merged_token_ids is not None:
+                assert merged_response_mask is not None
+                prompt_length = len(buffer.prompt_ids)
+                if merged_token_ids[:prompt_length] != buffer.prompt_ids:
+                    raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
+                buffer.response_ids = list(merged_token_ids[prompt_length:])
+                buffer.response_mask = list(merged_response_mask)
+                buffer.response_logprobs = list(merged_response_logprobs or [])
                 self._assert_response_logprob_alignment(buffer)
                 if new_image_data:
                     if image_data is None:
@@ -512,6 +533,7 @@ class GatewaySession:
                 tools=tools,
                 image_data=image_data,
                 video_data=video_data,
+                mm_processor_kwargs=mm_processor_kwargs,
                 capacity_exhausted=True,
                 chain_id=chain_id,
                 incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
@@ -542,6 +564,7 @@ class GatewaySession:
             tools=tools,
             image_data=image_data,
             video_data=video_data,
+            mm_processor_kwargs=mm_processor_kwargs,
             capacity_exhausted=False,
             chain_id=chain_id,
             incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
@@ -664,6 +687,7 @@ class GatewaySession:
         return list(media) if media is not None else None
 
     def _assert_response_logprob_alignment(self, buffer: TrajectoryBuffer) -> None:
+        assert len(buffer.response_mask) == len(buffer.response_ids), "response_mask must be aligned with response_ids"
         assert len(buffer.response_logprobs) in {
             0,
             len(buffer.response_ids),
@@ -817,12 +841,14 @@ class GatewaySession:
             trajectory_extra_fields["max_global_steps"] = max(mark[1] for mark in marks)
         if extra_fields:
             trajectory_extra_fields.update(extra_fields)
+        mm_processor_kwargs = self._codec.mm_processor_kwargs
+        if mm_processor_kwargs:
+            trajectory_extra_fields["mm_processor_kwargs"] = mm_processor_kwargs
         return Trajectory(
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),
             response_mask=list(chain.buffer.response_mask),
             response_logprobs=response_logprobs,
-            reward_info={},
             num_turns=self._count_chat_turns(chain.message_history),
             chain_id=chain.chain_id,
             routed_experts=chain.buffer.routed_experts,

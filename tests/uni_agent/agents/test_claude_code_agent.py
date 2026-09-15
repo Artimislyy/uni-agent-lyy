@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -52,13 +53,15 @@ def _agent() -> ClaudeCodeAgent:
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_ensure_claude_skips_install_when_already_available():
+def test_ensure_claude_skips_install_when_already_available(caplog):
     sandbox = _FakeSandbox(probe_results=[0])
+    caplog.set_level(logging.INFO, logger="uni_agent.agents.claude_code.agent")
 
     asyncio.run(_agent()._ensure_claude(sandbox))
 
     assert len(sandbox.calls) == 1
     assert sandbox.calls[0]["script"].startswith("command -v claude")
+    assert "claude_code: found existing claude on PATH; skipping installation" in caplog.text
 
 
 @pytest.mark.cpu
