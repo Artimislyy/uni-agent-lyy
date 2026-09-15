@@ -39,6 +39,7 @@
       top_p: 1.0
     extra_env:
       CLAUDE_STREAM_IDLE_TIMEOUT_MS: "1800000"
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: "2048"
 
   # 每个阶段各自拥有一个容器；Framework session_timeout 需要覆盖二者总时间。
   remote_workspace: /workspace/uni-agent-eda #任务文件都放在容器的这个路径下

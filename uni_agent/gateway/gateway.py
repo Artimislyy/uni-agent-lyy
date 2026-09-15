@@ -8,9 +8,11 @@ or SSE envelopes returned to clients.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
+import anyio
 import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -198,10 +200,51 @@ class _GatewayActor:
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        outcome = await session.run_generation(internal, self._backend)
         model = str(payload.get("model") or "unknown")
         if payload.get("stream") is True:
-            return anthropic_stream_response(outcome, model=model)
+
+            async def _stream():
+                ping = b'event: ping\ndata: {"type":"ping"}\n\n'
+                yield ping  # 尽早发送第一批字节
+                task = asyncio.create_task(session.run_generation(internal, self._backend))
+                try:
+                    while not task.done():
+                        # wait 超时只结束本次等待，不会取消模型生成。
+                        done, _ = await asyncio.wait({task}, timeout=15.0)
+                        if not done:
+                            yield ping
+
+                    # run_generation 返回前，已将生成结果记入会话轨迹。
+                    outcome = await task
+                    response = anthropic_stream_response(outcome, model=model)
+                    async for chunk in response.body_iterator:
+                        yield chunk
+                except Exception as exc:
+                    # HTTP 200 已发出，后续错误必须通过 SSE 返回。
+                    if isinstance(exc, HTTPException):
+                        error = anthropic_error_body(exc.status_code, str(exc.detail))
+                    else:
+                        logger.exception("Anthropic stream failed: session=%s", session_id)
+                        error = anthropic_error_body(500, "Internal server error")
+                    yield f"event: error\ndata: {json.dumps(error, ensure_ascii=False)}\n\n".encode()
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    # 流被取消时，允许本地生成任务执行清理逻辑。
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.gather(task, return_exceptions=True)
+
+            return StreamingResponse(
+                _stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        outcome = await session.run_generation(internal, self._backend)
         return JSONResponse(anthropic_build_response(outcome, model=model))
 
     async def start(self) -> None:
