@@ -206,6 +206,15 @@ class EDATask(Task):
                 policy_violation_reward=cfg.policy_violation_reward,
                 max_partial_credit=cfg.max_partial_credit,
             )
+            # 在验证沙箱销毁前，将原始结果保存到 repair.tcl 旁边。
+            if submission_path is not None:
+                try:
+                    result_bytes = await eval_sandbox.read_file(_remote_path(eval_root, cfg.result_path))
+                    result_path = submission_path.with_name("result.json")
+                    result_path.write_bytes(result_bytes)
+                    report["verifier_result_path"] = str(result_path)
+                except Exception as exc:
+                    logger.warning("无法保存验证 result.json，保留原评分结果：%s", exc)
 
         report.update(common_info)
         return TaskResult(
