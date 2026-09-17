@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 单机 NCCL 初始化崩溃的排查配置：绕过外部网络插件和 IB，输出详细日志。
-export NCCL_NET_PLUGIN=none
-export NCCL_NET=Socket
-export NCCL_IB_DISABLE=1
-export NCCL_DEBUG=INFO
-
 # 从任意目录调用都切回仓库根目录，保证相对路径一致。
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../.." && pwd)
@@ -16,7 +10,7 @@ cd "${repo_root}"
 DATA_DIR=${DATA_DIR:-/home/l00951262/input}
 RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
 EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/codataset_innovus_19_10}
-EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.2-patch.2}
+EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.3-patch.1}
 
 project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.8-27B-megatron}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
@@ -35,29 +29,30 @@ mkdir -p -- "${SUBMISSION_DIR}"
 NNODES_TRAIN=${NNODES_TRAIN:-1}
 NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
-TRAIN_TP=${TP:-2}
+TRAIN_TP=${TP:-4}
 TRAIN_PP=${PP:-1}
-TRAIN_CP=${CP:-2}
-ROLLOUT_TP=${GEN_TP:-2}
+TRAIN_CP=${CP:-1}
+ROLLOUT_TP=${GEN_TP:-4}
 
 # EDA episode 很慢且消耗 Innovus license，默认并发比 SWE-bench 保守。
-TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-4} # 每步训练 XX 个题目
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-2} #每次更新用 XX 个
-PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-2} #每 XX 次更新同步一次权重给推理引擎
+TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-1} # 每步训练 XX 个题目
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-1} #每次更新用 XX 个
+PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1} #每 XX 次更新同步一次权重给推理引擎
 N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-1} #每道题做 XX 条轨迹
-CONCURRENCY=${CONCURRENCY:-16} #最多同时运行**个session
-GATEWAY_COUNT=${GATEWAY_COUNT:-2} #启动XX个gateway actor
+CONCURRENCY=${CONCURRENCY:-4} #最多同时运行**个session
+GATEWAY_COUNT=${GATEWAY_COUNT:-4} #启动XX个gateway actor
 SESSION_TIMEOUT_SECONDS=${SESSION_TIMEOUT_SECONDS:-18000} #一个session最长运行 5 小时（18000 秒）
 SANDBOX_STARTUP_CONCURRENCY=${SANDBOX_STARTUP_CONCURRENCY:-16} #限制“同时启动多少个 sandbox”。
 
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((210 * 1024))}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((40 * 1024))}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((180 * 1024))}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-$((10 * 1024))}
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-"$(basename "${MODEL_PATH}")"} # Agent 发请求时用的就是这个别名
 MASK_UNFINISHED_EPISODE=${MASK_UNFINISHED_EPISODE:-True} #没做完的轨迹要不要参与训练，True 会 mask 掉，False 会直接参与训练。True 更安全，False 更快。
 
-USE_MBRIDGE=${USE_MBRIDGE:-False} # Megatron（NVIDIA 的训练框架）内部为了并行训练，会把权重切分、重排成自己专属的排布方式，和 HF 格式完全不同，mBridge 负责转换
 USE_DIST_CKPT=${USE_DIST_CKPT:-False}
+LORA_RANK=${LORA_RANK:-32} # LoRA 低秩矩阵维度，默认开启。
+LORA_ALPHA=${LORA_ALPHA:-32} # LoRA 缩放系数。
 OFFLOAD=${OFFLOAD:-True}
 OFFLOAD_FRACTION=${OFFLOAD_FRACTION:-1.0} #优化器状态 offload 的比例
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7} #vLLM 推理引擎最多占用 GPU 显存的 **%
@@ -117,39 +112,46 @@ trainer_args=(
     --config-name=ppo_megatron_trainer
     trainer.use_v1=True
     trainer.v1.trainer_mode=separate_async
-    trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES}
-    trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP}
-    trainer.v1.separate_async.hybrid_rollout.enable_switch=False
-    trainer.v1.sampler.max_off_policy_threshold=8
-    trainer.v1.sampler.max_off_policy_strategy=drop
-    transfer_queue.enable=True
+    trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES} ##正式训练前先空跑几个 batch“热身”（不更新参数，只让各组件跑通、显存分配稳定）。0 = 不热身，直接开训。
+    trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP} #每 XX 次更新同步一次权重给推理引擎
+    trainer.v1.separate_async.hybrid_rollout.enable_switch=False #是否启用混合回放
+    trainer.v1.sampler.max_off_policy_threshold=8 #最大允许的 off-policy 样本数，超过这个阈值就丢弃最旧的样本
+    trainer.v1.sampler.max_off_policy_strategy=drop #超过阈值时的处理策略，drop = 丢弃最旧的样本，replace = 替换最旧的样本
+    transfer_queue.enable=True #是否启用 TransferQueue，TransferQueue 用于在训练和推理之间传递样本数据
 
     data.train_files="${TRAIN_FILE}"
     data.val_files="${TEST_FILE}"
-    data.prompt_key=prompt
-    data.return_raw_chat=True
-    data.filter_overlong_prompts=True
-    data.truncation=error
-    data.max_prompt_length=${MAX_PROMPT_LENGTH}
-    data.max_response_length=${MAX_RESPONSE_LENGTH}
-    data.train_batch_size=${TRAIN_PROMPT_BSZ}
+    data.prompt_key=prompt #parquet 里题目文本所在列名
+    data.return_raw_chat=True #
+    data.filter_overlong_prompts=True #超长 prompt 直接过滤掉，不训练
+    data.truncation=error #遇到需要截断的情况直接报错而不是悄悄截断（EDA 数据截断就没意义了，宁可失败暴露问题）。
+    data.max_prompt_length=${MAX_PROMPT_LENGTH} #最大 prompt 长度
+    data.max_response_length=${MAX_RESPONSE_LENGTH} #最大 response 长度
+    data.train_batch_size=${TRAIN_PROMPT_BSZ} #每步训练 XX 个题目
 
-    algorithm.adv_estimator=grpo
-    algorithm.use_kl_in_reward=False
-    algorithm.kl_ctrl.kl_coef=0.0
-    algorithm.rollout_correction.bypass_mode=False
-    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
-    actor_rollout_ref.actor.use_kl_loss=False
-    actor_rollout_ref.actor.entropy_coeff=0
-    actor_rollout_ref.actor.clip_ratio_low=0.2
-    actor_rollout_ref.actor.clip_ratio_high=0.28
-    actor_rollout_ref.actor.clip_ratio_c=10.0
-    actor_rollout_ref.actor.loss_agg_mode=token-mean
+    algorithm.adv_estimator=grpo #优势估计器
+    algorithm.use_kl_in_reward=False #奖励里不加 KL 惩罚
+    algorithm.kl_ctrl.kl_coef=0.0 #KL 惩罚系数
+    algorithm.rollout_correction.bypass_mode=False #bypass_mode=False 时，训练侧会在这批数据开始更新前重算一次 old_log_probs
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla #策略损失用标准 PPO-clip 形式。
+    actor_rollout_ref.actor.use_kl_loss=False #损失里同样不加 KL 项
+    actor_rollout_ref.actor.entropy_coeff=0 #不加熵正则（不额外鼓励探索）
+    actor_rollout_ref.actor.clip_ratio_low=0.2 #策略更新的下界
+    actor_rollout_ref.actor.clip_ratio_high=0.28 #策略更新的上界
+    actor_rollout_ref.actor.clip_ratio_c=10.0 #策略更新的惩罚系数
+    actor_rollout_ref.actor.loss_agg_mode=token-mean #损失按 token 平均
 
     actor_rollout_ref.model.path="${MODEL_PATH}"
+    # Megatron LoRA 使用 model.lora.*；冻结基础权重，仅训练适配器。
+    actor_rollout_ref.model.lora.type=lora
+    actor_rollout_ref.model.lora.rank=${LORA_RANK}
+    actor_rollout_ref.model.lora.alpha=${LORA_ALPHA}
+    actor_rollout_ref.model.lora.dropout=0.0
+    # 推理前合并 LoRA 权重并同步给 vLLM；训练侧仍只更新 LoRA。
+    actor_rollout_ref.model.lora.merge=True
     +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=${total_context}
-    actor_rollout_ref.model.use_fused_kernels=True
-    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.model.use_fused_kernels=True #用 Megatron 融合算子提速。
+    actor_rollout_ref.actor.use_dynamic_bsz=True #动态 batch：按 token 总量而非固定样本数组 batch，长轨迹时自动减少每批样本数防 OOM。
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_token_len}
     actor_rollout_ref.actor.optim.lr=1e-6
@@ -164,7 +166,7 @@ trainer_args=(
     actor_rollout_ref.actor.megatron.vanilla_mbridge=False
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=${USE_DIST_CKPT}
     actor_rollout_ref.actor.megatron.param_offload=${OFFLOAD}
-    actor_rollout_ref.actor.megatron.grad_offload=${OFFLOAD}
+    # actor_rollout_ref.actor.megatron.grad_offload=${OFFLOAD}
     actor_rollout_ref.actor.megatron.optimizer_offload=${OFFLOAD}
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP}
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP}
@@ -251,10 +253,6 @@ trainer_args=(
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
 
     # 直接启动 Python 后，verl 内部仍使用 Ray；显式传入 worker 环境变量。
-    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET_PLUGIN='${NCCL_NET_PLUGIN}'"
-    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_NET='${NCCL_NET}'"
-    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE='${NCCL_IB_DISABLE}'"
-    "++ray_kwargs.ray_init.runtime_env.env_vars.NCCL_DEBUG='${NCCL_DEBUG}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_DATASET_ROOT='${EDA_DATASET_ROOT}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SANDBOX_IMAGE='${EDA_SANDBOX_IMAGE}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SUBMISSION_DIR='${SUBMISSION_DIR}'"
@@ -262,6 +260,7 @@ trainer_args=(
 )
 
 echo "Starting EDA separate_async: train=${NNODES_TRAIN}x${NGPUS_PER_NODE} GPUs, rollout=${NNODES_ROLLOUT}x${NGPUS_PER_NODE} GPUs"
+echo "Megatron LoRA: rank=${LORA_RANK}, alpha=${LORA_ALPHA}, merge=True"
 echo "Each step uses ${TRAIN_PROMPT_BSZ} prompts x ${N_RESP_PER_PROMPT} trajectories; sandbox concurrency limit: ${CONCURRENCY}"
 echo "Accepted repair.tcl files will be saved under ${SUBMISSION_DIR}"
 
