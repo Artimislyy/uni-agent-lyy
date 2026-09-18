@@ -9,7 +9,7 @@ cd "${repo_root}"
 # 默认使用 A100 服务器的路径和镜像；环境变量非空时优先使用环境变量。
 DATA_DIR=${DATA_DIR:-/home/l00951262/input}
 RUNTIME_DIR=${RUNTIME_DIR:-/home/l00951262/output}
-EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/codataset_innovus_19_10}
+EDA_DATASET_ROOT=${EDA_DATASET_ROOT:-/home/l00951262/EDA/dataset_innovus_19_10}
 EDA_SANDBOX_IMAGE=${EDA_SANDBOX_IMAGE:-crpi-lmega5fbvej4u3db.cn-shanghai.personal.cr.aliyuncs.com/novigrad/eda:v0.3-patch.1}
 
 project_name=${PROJECT_NAME:-Uni-Agent-EDA-Qwen3.8-27B-megatron}
@@ -23,21 +23,19 @@ CKPTS_DIR=${CKPTS_DIR:-"${RUNTIME_DIR}/ckpts/${project_name}/${exp_name}"}
 AGENT_LOG_DIR=${AGENT_LOG_DIR:-"${RUNTIME_DIR}/logs/${project_name}/${exp_name}"}
 SUBMISSION_DIR=${SUBMISSION_DIR:-"${RUNTIME_DIR}/submissions/${project_name}/${exp_name}"}
 
-mkdir -p -- "${SUBMISSION_DIR}"
+mkdir -p -- "${AGENT_LOG_DIR}" "${SUBMISSION_DIR}"
 
-# 模型训练卡与 rollout 卡是两个不重叠的 Ray resource pool。
+# 共卡同步：同一组 8 张卡先 rollout，再训练；CP=2 分担长序列。
 NNODES_TRAIN=${NNODES_TRAIN:-1}
-NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
-TRAIN_TP=${TP:-4}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+TRAIN_TP=${TP:-8}
 TRAIN_PP=${PP:-1}
 TRAIN_CP=${CP:-1}
-ROLLOUT_TP=${GEN_TP:-4}
+ROLLOUT_TP=${GEN_TP:-8}
 
 # EDA episode 很慢且消耗 Innovus license，默认并发比 SWE-bench 保守。
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-1} # 每步训练 XX 个题目
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-1} #每次更新用 XX 个
-PARAMETER_SYNC_STEP=${PARAMETER_SYNC_STEP:-1} #每 XX 次更新同步一次权重给推理引擎
 N_RESP_PER_PROMPT=${N_RESP_PER_PROMPT:-1} #每道题做 XX 条轨迹
 CONCURRENCY=${CONCURRENCY:-4} #最多同时运行**个session
 GATEWAY_COUNT=${GATEWAY_COUNT:-4} #启动XX个gateway actor
@@ -56,17 +54,16 @@ LORA_ALPHA=${LORA_ALPHA:-32} # LoRA 缩放系数。
 OFFLOAD=${OFFLOAD:-True}
 OFFLOAD_FRACTION=${OFFLOAD_FRACTION:-1.0} #优化器状态 offload 的比例
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.7} #vLLM 推理引擎最多占用 GPU 显存的 **%
-NUM_WARMUP_BATCHES=${NUM_WARMUP_BATCHES:-0} #正式训练前先空跑几个 batch“热身”（不更新参数，只让各组件跑通、显存分配稳定）。0 = 不热身，直接开训。
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-10} #整个训练数据集完整过 ** 遍
 SAVE_FREQ=${SAVE_FREQ:-10} #每 ** 个训练步保存一次 checkpoint
 LR_DECAY_STEPS=${LR_DECAY_STEPS:-2000} #学习率衰减计划的步数
 
-if ((TRAIN_PROMPT_BSZ != PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE)); then
-    echo "Error: TRAIN_PROMPT_BSZ must equal PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE" >&2
+if ((TRAIN_PROMPT_BSZ <= 0 || PPO_MINI_BATCH_SIZE <= 0 || TRAIN_PROMPT_BSZ % PPO_MINI_BATCH_SIZE != 0)); then
+    echo "Error: batch sizes must be positive and TRAIN_PROMPT_BSZ must be divisible by PPO_MINI_BATCH_SIZE" >&2
     exit 2
 fi
-if ((NNODES_TRAIN <= 0 || NNODES_ROLLOUT <= 0 || NGPUS_PER_NODE <= 0)); then
-    echo "Error: training nodes, rollout nodes, and GPUs per node must all be greater than 0" >&2
+if ((NNODES_TRAIN <= 0 || NGPUS_PER_NODE <= 0)); then
+    echo "Error: nodes and GPUs per node must all be greater than 0" >&2
     exit 2
 fi
 if ((TRAIN_TP <= 0 || TRAIN_PP <= 0 || TRAIN_CP <= 0 || ROLLOUT_TP <= 0)); then
@@ -79,7 +76,7 @@ if ((train_world_size % train_model_parallel_size != 0)); then
     echo "Error: the total number of training GPUs must be divisible by TP * PP * CP" >&2
     exit 2
 fi
-if (((NNODES_ROLLOUT * NGPUS_PER_NODE) % ROLLOUT_TP != 0)); then
+if ((train_world_size % ROLLOUT_TP != 0)); then
     echo "Error: the total number of rollout GPUs must be divisible by ROLLOUT_TP" >&2
     exit 2
 fi
@@ -111,12 +108,7 @@ infer_token_len=$((total_context / TRAIN_CP))
 trainer_args=(
     --config-name=ppo_megatron_trainer
     trainer.use_v1=True
-    trainer.v1.trainer_mode=separate_async
-    trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES} ##正式训练前先空跑几个 batch“热身”（不更新参数，只让各组件跑通、显存分配稳定）。0 = 不热身，直接开训。
-    trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP} #每 XX 次更新同步一次权重给推理引擎
-    trainer.v1.separate_async.hybrid_rollout.enable_switch=False #是否启用混合回放
-    trainer.v1.sampler.max_off_policy_threshold=8 #最大允许的 off-policy 样本数，超过这个阈值就丢弃最旧的样本
-    trainer.v1.sampler.max_off_policy_strategy=drop #超过阈值时的处理策略，drop = 丢弃最旧的样本，replace = 替换最旧的样本
+    trainer.v1.trainer_mode=sync # 等本轮 rollout 完成、推理引擎休眠后再训练，每步结束同步权重。
     transfer_queue.enable=True #是否启用 TransferQueue，TransferQueue 用于在训练和推理之间传递样本数据
 
     data.train_files="${TRAIN_FILE}"
@@ -142,26 +134,24 @@ trainer_args=(
     actor_rollout_ref.actor.loss_agg_mode=token-mean #损失按 token 平均
 
     actor_rollout_ref.model.path="${MODEL_PATH}"
-    # Megatron LoRA 使用 model.lora.*；冻结基础权重，仅训练适配器。
-    actor_rollout_ref.model.lora.type=lora
+    actor_rollout_ref.model.lora.type=lora # Megatron LoRA 使用 model.lora.*；冻结基础权重，仅训练适配器。
     actor_rollout_ref.model.lora.rank=${LORA_RANK}
     actor_rollout_ref.model.lora.alpha=${LORA_ALPHA}
-    actor_rollout_ref.model.lora.dropout=0.0
-    # 推理前合并 LoRA 权重并同步给 vLLM；训练侧仍只更新 LoRA。
-    actor_rollout_ref.model.lora.merge=True
+    actor_rollout_ref.model.lora.dropout=0.0 #训练时不做随机丢弃
+    actor_rollout_ref.model.lora.merge=True #把 LoRA 的调整合进基础权重后，再交给 rollout 引擎生成回答，如果是false,就是让生成引擎分别接收基础模型和 LoRA 适配器
     +actor_rollout_ref.model.override_config.model_config.max_position_embeddings=${total_context}
     actor_rollout_ref.model.use_fused_kernels=True #用 Megatron 融合算子提速。
     actor_rollout_ref.actor.use_dynamic_bsz=True #动态 batch：按 token 总量而非固定样本数组 batch，长轨迹时自动减少每批样本数防 OOM。
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_token_len}
-    actor_rollout_ref.actor.optim.lr=1e-6
-    actor_rollout_ref.actor.optim.lr_decay_style=constant
-    actor_rollout_ref.actor.optim.weight_decay=0.1
-    actor_rollout_ref.actor.optim.lr_decay_steps=${LR_DECAY_STEPS}
-    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=${OFFLOAD_FRACTION}
-    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
-    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
-    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_token_len} #每张 GPU 可处理的 token 预算。框架会按样本实际长度，动态决定这一小批放几条样本。
+    actor_rollout_ref.actor.optim.lr=1e-6 #学习率，每次更新的基本步幅是 0.000001。
+    actor_rollout_ref.actor.optim.lr_decay_style=constant #预热结束后，学习率保持不变。
+    actor_rollout_ref.actor.optim.weight_decay=0.1 #权重衰减强度，用于约束参数；不是每一步直接把权重减去 10%。
+    actor_rollout_ref.actor.optim.lr_decay_steps=${LR_DECAY_STEPS} #学习率衰减计划的步数；但当前选的是 constant，所以它不会让学习率按这些步数逐渐下降。
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=${OFFLOAD_FRACTION}  #决定卸载比例。例如设为 0.5，目标是卸载约一半；设为 1.0，目标是全部卸载。
+    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True #尝试让 CPU 更新与 GPU↔CPU 数据传输同时进行，减少等待。d2h 是设备到主机，h2d 是主机到设备。
+    +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True #启用可分别设置优化器内部数据精度的模式。它不等于自动把所有状态改成 BF16；实际精度还要看 main_grads_dtype、exp_avg_dtype 等设置。
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True #开启 CPU 卸载：把部分优化器状态和更新计算放到 CPU，腾出 GPU 显存。
     actor_rollout_ref.actor.megatron.use_mbridge=True
     actor_rollout_ref.actor.megatron.vanilla_mbridge=False
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=${USE_DIST_CKPT}
@@ -184,8 +174,9 @@ trainer_args=(
     "+actor_rollout_ref.actor.checkpoint.save_contents=['model','hf_model']"
 
     actor_rollout_ref.rollout.name=vllm
-    actor_rollout_ref.rollout.mode=async
-    actor_rollout_ref.rollout.nnodes=${NNODES_ROLLOUT}
+    actor_rollout_ref.rollout.disable_log_stats=False # 打印推理吞吐量、运行和等待请求数。
+    actor_rollout_ref.rollout.mode=async # vLLM 服务接口；训推执行顺序由上面的 trainer_mode=sync 控制。
+    actor_rollout_ref.rollout.nnodes=0 # 使用训练资源池，不创建独立推理资源池。
     actor_rollout_ref.rollout.n_gpus_per_node=${NGPUS_PER_NODE}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}
@@ -197,10 +188,9 @@ trainer_args=(
     actor_rollout_ref.rollout.max_num_batched_tokens=${total_context}
     actor_rollout_ref.rollout.max_model_len=${total_context}
     actor_rollout_ref.rollout.enable_chunked_prefill=True
-    actor_rollout_ref.rollout.enforce_eager=False
+    actor_rollout_ref.rollout.enforce_eager=False #允许用 CUDA Graph，加速小 batch 解码
     actor_rollout_ref.rollout.free_cache_engine=True
-    actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=2048
+    actor_rollout_ref.rollout.checkpoint_engine.backend=naive # 共卡权重同步。
     actor_rollout_ref.rollout.temperature=1.0
     actor_rollout_ref.rollout.top_p=1.0
     actor_rollout_ref.rollout.top_k=-1
@@ -245,26 +235,30 @@ trainer_args=(
     trainer.test_freq=-1
     trainer.save_freq=${SAVE_FREQ}
     trainer.total_epochs=${TOTAL_EPOCHS}
-    # 默认不恢复 TransferQueue，避免旧的 in-flight 请求在训练卡休眠前被重新下发。
-    # 需要续训时可在脚本末尾追加 trainer.resume_mode=auto，但会放宽严格不共卡保证。
+    # 默认从新任务开始；需要续训时可在脚本末尾追加 trainer.resume_mode=auto。
     trainer.resume_mode=disable
     trainer.default_local_dir="${CKPTS_DIR}"
     trainer.nnodes=${NNODES_TRAIN}
     trainer.n_gpus_per_node=${NGPUS_PER_NODE}
 
     # 直接启动 Python 后，verl 内部仍使用 Ray；显式传入 worker 环境变量。
+    "++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_LOGGING_LEVEL='INFO'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_DATASET_ROOT='${EDA_DATASET_ROOT}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SANDBOX_IMAGE='${EDA_SANDBOX_IMAGE}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_SUBMISSION_DIR='${SUBMISSION_DIR}'"
     "++ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY='${SANDBOX_STARTUP_CONCURRENCY}'"
+    # 收集各训练卡的实际长度、可训练参数量和显存；定位完成后设为 0。
+    "++ray_kwargs.ray_init.runtime_env.env_vars.EDA_TRAIN_MEMORY_DEBUG='${EDA_TRAIN_MEMORY_DEBUG:-1}'"
 )
 
-echo "Starting EDA separate_async: train=${NNODES_TRAIN}x${NGPUS_PER_NODE} GPUs, rollout=${NNODES_ROLLOUT}x${NGPUS_PER_NODE} GPUs"
+echo "Starting EDA sync: rollout and training share ${NNODES_TRAIN}x${NGPUS_PER_NODE} GPUs"
+echo "Training TP=${TRAIN_TP}, PP=${TRAIN_PP}, CP=${TRAIN_CP}; rollout TP=${ROLLOUT_TP}"
 echo "Megatron LoRA: rank=${LORA_RANK}, alpha=${LORA_ALPHA}, merge=True"
 echo "Each step uses ${TRAIN_PROMPT_BSZ} prompts x ${N_RESP_PER_PROMPT} trajectories; sandbox concurrency limit: ${CONCURRENCY}"
 echo "Accepted repair.tcl files will be saved under ${SUBMISSION_DIR}"
 
 # Docker 由 ray_task 所在宿主机的 daemon 创建，各候选节点需要 Docker 权限和同名镜像。
+# 控制台日志同时落到 AGENT_LOG_DIR/driver.log，便于训练结束后回溯（pipefail 保证 Python 退出码透传）。
 python3 -m verl.trainer.main_ppo \
     "${trainer_args[@]}" \
-    "$@"
+    "$@" 2>&1 | tee "${AGENT_LOG_DIR}/driver.log"
